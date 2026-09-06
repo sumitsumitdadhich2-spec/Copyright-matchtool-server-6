@@ -63,7 +63,7 @@ export function sessionCookieOptions() {
     httpOnly: true,
     // v0 preview iframe is cross-site; SameSite=None + Secure is required
     // for the cookie to be retained there. Also correct in production (HTTPS).
-    sameSite: (process.env.SITE_ADDRESS && process.env.SITE_ADDRESS !== ':80' ? 'none' : 'lax') as const,
+    sameSite: (process.env.SITE_ADDRESS && process.env.SITE_ADDRESS !== ':80' ? ('none' as const) : ('lax' as const)),
     secure: process.env.SITE_ADDRESS ? process.env.SITE_ADDRESS !== ':80' : true,
     path: '/',
     maxAge: SESSION_DAYS * 24 * 60 * 60,
