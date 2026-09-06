@@ -2,7 +2,7 @@
 
 import { useState } from 'react'
 import useSWR from 'swr'
-import { KeyRound, Check, ShieldCheck, X } from 'lucide-react'
+import { KeyRound, Check, ShieldCheck, X, Sparkles, HardDrive } from 'lucide-react'
 import { fetcher } from '@/lib/format'
 
 interface KeySlot {
@@ -33,6 +33,28 @@ export function ApiKeyPanel() {
   const [tlValue, setTlValue] = useState('')
   const [tlSaving, setTlSaving] = useState(false)
   const [tlSaved, setTlSaved] = useState(false)
+  const [cleaningStorage, setCleaningStorage] = useState(false)
+  const [cleanMsg, setCleanMsg] = useState<string | null>(null)
+
+  async function cleanGeminiStorage() {
+    setCleaningStorage(true)
+    setCleanMsg(null)
+    setError(null)
+    const res = await fetch('/api/settings', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ cleanupStorage: true }),
+    })
+    setCleaningStorage(false)
+    if (!res.ok) {
+      const j = await res.json().catch(() => ({}))
+      setError(j.error || 'Failed to sweep Gemini cloud storage')
+      return
+    }
+    const j = (await res.json().catch(() => ({}))) as { deleted?: number; total?: number }
+    setCleanMsg(`Storage Cleaned: ${j.deleted ?? 0} temporary file(s) deleted from Gemini Cloud Files API (Checked ${j.total ?? 0}).`)
+    setTimeout(() => setCleanMsg(null), 5000)
+  }
 
   async function saveTl() {
     const v = tlValue.trim()
@@ -231,6 +253,37 @@ export function ApiKeyPanel() {
           karta hai (Gemini quota saver). Khali chhodo to app bilkul normal full-scan mode me chalega, koi asar nahi.
         </p>
       </div>
+
+      {/* ---------- Gemini Cloud Files API Storage Cleaner (20 GB Quota Protector) ---------- */}
+      {slots.some((s) => s.hasKey) && (
+        <div className="mt-4 rounded-lg border border-border bg-card/60 p-3">
+          <div className="flex items-center justify-between gap-3">
+            <div className="flex items-center gap-2">
+              <HardDrive className="size-4 text-primary" aria-hidden />
+              <div>
+                <h2 className="text-sm font-semibold">Gemini Cloud Storage (20 GB Quota Sweep)</h2>
+                <p className="text-xs text-muted-foreground">
+                  Purani temporary uploaded movie/short clips ko Files API se sweep karke 20 GB storage limit free rakhta hai.
+                </p>
+              </div>
+            </div>
+            <button
+              type="button"
+              onClick={() => cleanGeminiStorage()}
+              disabled={cleaningStorage}
+              className="inline-flex shrink-0 items-center gap-1.5 rounded-md border border-border bg-secondary px-3 py-1.5 text-xs font-medium hover:bg-secondary/80 disabled:opacity-50"
+            >
+              <Sparkles className="size-3.5 text-primary" aria-hidden />
+              {cleaningStorage ? 'Sweeping Storage...' : 'Sweep Storage Now'}
+            </button>
+          </div>
+          {cleanMsg && (
+            <p className="mt-2 text-xs font-medium text-success">
+              ✓ {cleanMsg}
+            </p>
+          )}
+        </div>
+      )}
 
       <p className="mt-3 text-xs leading-relaxed text-muted-foreground">
         Add 1 to 20 keys — the scan works with ANY number. All keys scan chunks in parallel first, then all keys run 24fps

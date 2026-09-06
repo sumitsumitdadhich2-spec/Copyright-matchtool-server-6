@@ -4,6 +4,7 @@ import {
   getUserKeyN,
   setUserKeyN,
   clearUserKeyN,
+  getAllUserApiKeys,
   getUserTwelveLabsKey,
   setUserTwelveLabsKey,
   clearUserTwelveLabsKey,
@@ -14,6 +15,7 @@ import {
 import { getSession } from '@/lib/users'
 import { MODEL_POOL } from '@/lib/models'
 import { poolSnapshot } from '@/lib/ffmpeg-pool'
+import { cleanupOrphanedGeminiFiles } from '@/lib/gemini'
 
 export const runtime = 'nodejs'
 
@@ -96,6 +98,19 @@ export async function POST(req: Request) {
     }
     await setUserTwelveLabsKey(username, key)
     return NextResponse.json({ ok: true })
+  }
+
+  // ----- On-demand Gemini storage sweep: { cleanupStorage: true } -----
+  if (body.cleanupStorage === true) {
+    const keys = await getAllUserApiKeys(username)
+    let totalDeleted = 0
+    let totalChecked = 0
+    for (const k of keys) {
+      const res = await cleanupOrphanedGeminiFiles(k, 0) // delete all temporary files
+      totalDeleted += res.deleted
+      totalChecked += res.total
+    }
+    return NextResponse.json({ ok: true, deleted: totalDeleted, total: totalChecked })
   }
 
   // ----- Clear a key slot: { clear: n } -----

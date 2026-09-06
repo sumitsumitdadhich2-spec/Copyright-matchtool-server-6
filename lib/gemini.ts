@@ -87,6 +87,37 @@ export async function deleteFileQuiet(ai: GoogleGenAI, name: string) {
   }
 }
 
+/**
+ * Sweeps the Gemini Files API for the provided key and removes any uploaded clips
+ * that are older than `olderThanMs` (default 2 hours) to prevent hitting the 20 GB storage cap.
+ */
+export async function cleanupOrphanedGeminiFiles(
+  apiKey: string,
+  olderThanMs: number = 2 * 60 * 60_000,
+): Promise<{ deleted: number; total: number }> {
+  try {
+    const ai = getClient(apiKey)
+    const pager = await ai.files.list({ config: { pageSize: 100 } })
+    let deleted = 0
+    let total = 0
+    const now = Date.now()
+
+    for await (const file of pager) {
+      total++
+      const createTime = file.createTime ? new Date(file.createTime).getTime() : 0
+      const isOld = createTime > 0 ? now - createTime > olderThanMs : true
+      if (file.name && isOld) {
+        await deleteFileQuiet(ai, file.name)
+        deleted++
+      }
+    }
+    return { deleted, total }
+  } catch (err) {
+    console.warn(`[Gemini Storage Cleanup] Failed to cleanup files for key: ${err instanceof Error ? err.message : String(err)}`)
+    return { deleted: 0, total: 0 }
+  }
+}
+
 export function classifyError(err: unknown): GeminiError {
   if (err instanceof GeminiError) return err
   const msg = err instanceof Error ? err.message : String(err)

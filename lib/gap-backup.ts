@@ -6,7 +6,7 @@ import { getScan, saveScan, addLog, apiKeyHash, scanMediaDir, getModelUsage, inc
 import { ensureLocalMedia, localMediaPath } from './media'
 import { buildBackupClip, chunkPath, extractClipPrecise } from './ffmpeg'
 import { CHUNK_MODEL_POOL, RESCAN_BACKUP_POOL } from './models'
-import { deleteFileQuiet, getClient, parseGapFinderOutput, runGapFinderChunk, uploadVideo, classifyError, GeminiError, type GapFinderPartSpec } from './gemini'
+import { deleteFileQuiet, cleanupOrphanedGeminiFiles, getClient, parseGapFinderOutput, runGapFinderChunk, uploadVideo, classifyError, GeminiError, type GapFinderPartSpec } from './gemini'
 import { COVERAGE_MIN_GAP_SEC, coverageFromRanges, gapsOf, mergeRanges, shortTotalOf } from './short-coverage'
 import { scheduler } from './scheduler'
 import type { ChunkMatch, GapBackupCandidate, GapBackupMinute, GapBackupPart, GapBackupRequest, GapBackupState, Scan, ShortRange } from './types'
@@ -130,6 +130,9 @@ export function startGapBackup(id: string, apiKeys: string[]) {
   const isNewDay = checkDailyReset()
   if (isNewDay) {
     addLog(scan, 'success', `[Daily Quota Reset] New date detected (${geminiUsageDay()}) — all Gemini daily quotas reset to fresh state.`)
+  }
+  for (const k of apiKeys) {
+    void cleanupOrphanedGeminiFiles(k, 2 * 60 * 60_000)
   }
   const gaps = uncovered(scan)
   if (!gaps.length) return { ok: false, error: 'No true uncovered ranges remain' }

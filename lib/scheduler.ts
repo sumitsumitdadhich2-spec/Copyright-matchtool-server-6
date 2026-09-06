@@ -43,6 +43,7 @@ import {
   getClient,
   uploadVideo,
   deleteFileQuiet,
+  cleanupOrphanedGeminiFiles,
   mapChunkRequest,
   parseChunkMatches,
   verifyRequest,
@@ -151,6 +152,15 @@ class Scheduler {
         this.onDailyReset()
       }
     }, 30_000)
+
+    // Periodic Gemini Storage Cleanup every 15 minutes: sweeps old orphaned files (>2 hours) from Gemini Files API
+    setInterval(() => {
+      for (const [, job] of this.jobs.entries()) {
+        for (const lane of job.lanes) {
+          void cleanupOrphanedGeminiFiles(lane.apiKey, 2 * 60 * 60_000)
+        }
+      }
+    }, 15 * 60_000)
   }
 
   /** Called whenever the date rolls over or a new day is detected.
@@ -284,6 +294,11 @@ class Scheduler {
         'success',
         `[Daily Quota Reset] New date detected (${geminiUsageDay()}) — all Gemini daily quotas reset to fresh state.`,
       )
+    }
+
+    // Proactive Storage Sweep: clean any orphaned Gemini files older than 2 hours to prevent hitting the 20 GB cap
+    for (const k of apiKeys) {
+      void cleanupOrphanedGeminiFiles(k, 2 * 60 * 60_000)
     }
 
     if (!Array.isArray(scan.matches)) scan.matches = []
@@ -1940,6 +1955,8 @@ class Scheduler {
         p.then((f) => deleteFileQuiet(lane.ai, f.name)).catch(() => {})
       }
       lane.chunkUploads.clear()
+      // Background sweep on this lane's API key to keep storage clean
+      void cleanupOrphanedGeminiFiles(lane.apiKey, 2 * 60 * 60_000)
     }
     if (job.saverTimer) clearInterval(job.saverTimer)
     saveScan(job.scan)

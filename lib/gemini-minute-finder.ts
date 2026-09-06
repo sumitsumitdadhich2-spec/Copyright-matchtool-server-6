@@ -3,13 +3,15 @@ import 'server-only'
 import fs from 'node:fs'
 import path from 'node:path'
 import type { GoogleGenAI } from '@google/genai'
-import { getScan, saveScan, addLog, scanMediaDir, apiKeyHash, getModelUsage, incrementModelUsage, setModelExhausted } from './store'
+import { getScan, saveScan, addLog, scanMediaDir, apiKeyHash, getModelUsage, incrementModelUsage, setModelExhausted, checkDailyReset, geminiUsageDay } from './store'
 import { ensureLocalMedia, localMediaPath } from './media'
 import { preparePrescanMovieCopy, buildBackupClip } from './ffmpeg'
 import { CHUNK_MODEL_POOL, MODEL_MIN_INTERVAL_MS, RATE_COOLDOWN_MS, type ModelSpec } from './models'
 import {
   getClient,
   uploadVideo,
+  deleteFileQuiet,
+  cleanupOrphanedGeminiFiles,
   runMinuteFinderWindow,
   parseMinuteFinderOutput,
   runBackupMinuteFinderWindow,
@@ -200,6 +202,11 @@ export function startGeminiMinuteFinder(
     return { ok: false, error: 'Gemini API key nahi hai — Settings me apni key add karo.' }
   }
 
+  const isNewDay = checkDailyReset()
+  if (isNewDay) {
+    addLog(scan, 'success', `[Daily Quota Reset] New date detected (${geminiUsageDay()}) — all Gemini daily quotas reset to fresh state.`)
+  }
+
   const prev: GeminiPrescanState = scan.geminiPrescan ? { ...emptyState(), ...scan.geminiPrescan } : emptyState()
   const { trimStart, trimEnd } = trimRange(scan)
   const trimChanged =
@@ -224,8 +231,14 @@ export function startGeminiMinuteFinder(
     state.windows = []
     state.minuteSuggestions = undefined
     state.backup = undefined
+    // Proactive storage sweep on start: clean any orphaned files older than 2 hours
+    void cleanupOrphanedGeminiFiles(apiKey, 2 * 60 * 60_000)
+
     for (const k of Object.keys(state.uploads)) {
       const u = state.uploads[k]
+      if (u.movieName) {
+        void deleteFileQuiet(getClient(apiKey), u.movieName)
+      }
       state.uploads[k] = { ...u, movieUri: '', movieName: '' }
     }
   }
