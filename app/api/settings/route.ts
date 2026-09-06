@@ -27,10 +27,29 @@ export async function GET() {
   const session = await getSession()
   if (!session) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
 
-  const keys: { index: number; hasKey: boolean; maskedKey: string | null }[] = []
+  const keys: {
+    index: number
+    hasKey: boolean
+    maskedKey: string | null
+    usage: Record<string, number> | null
+    totalRequests: number
+  }[] = []
   for (let n = 1; n <= MAX_API_KEYS; n++) {
     const k = await getUserKeyN(session.username, n)
-    keys.push({ index: n, hasKey: Boolean(k), maskedKey: k ? mask(k) : null })
+    const usage = k ? getAllUsage(k) : null
+    let totalRequests = 0
+    if (usage) {
+      for (const val of Object.values(usage)) {
+        if (typeof val === 'number') totalRequests += val
+      }
+    }
+    keys.push({
+      index: n,
+      hasKey: Boolean(k),
+      maskedKey: k ? mask(k) : null,
+      usage,
+      totalRequests,
+    })
   }
   const key1 = await getUserKeyN(session.username, 1)
   const tlKey = await getUserTwelveLabsKey(session.username)

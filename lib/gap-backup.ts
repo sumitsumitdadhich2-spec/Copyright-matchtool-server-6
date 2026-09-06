@@ -403,30 +403,34 @@ async function runGapBackup(scan: Scan, apiKeys: string[], gaps: ShortRange[], c
           } catch (err) {
             const e = err instanceof GeminiError ? err : classifyError(err)
             if (e.kind === 'invalid_key') {
-              lane.dead = true
-              for (const m of [...CHUNK_MODEL_POOL, ...RESCAN_BACKUP_POOL]) {
-                setModelExhausted(m.id, lane.key, m.rpd)
+              for (const l of allLanes) {
+                if (l.key === lane.key) {
+                  l.dead = true
+                  for (const m of [...CHUNK_MODEL_POOL, ...RESCAN_BACKUP_POOL]) {
+                    setModelExhausted(m.id, l.key, m.rpd)
+                  }
+                }
               }
               queue.push(item)
               log(scan, 'error', `Missing-scene finder: Key ${lane.keyIndex + 1} is invalid/expired — permanently disabled; chunk ${chunkIndex + 1} re-queued for another key`)
             } else if (e.kind === 'rpd' || e.kind === 'unavailable') {
               setModelExhausted(lane.model.id, lane.key, lane.model.rpd)
+              lane.dead = true
               queue.push(item)
-              log(scan, 'warn', `Missing-scene finder: ${lane.model.id} (key ${lane.keyIndex + 1}) daily quota exhausted (20/20 RPD) — chunk ${chunkIndex + 1} re-queued for another worker`)
+              log(scan, 'warn', `Missing-scene finder: ${lane.model.id} (key ${lane.keyIndex + 1}) daily quota exhausted (${lane.model.rpd}/${lane.model.rpd} RPD) — model lane removed, key ${lane.keyIndex + 1}'s other models remain active; chunk ${chunkIndex + 1} re-queued`)
             } else if (e.kind === 'rate' || is503OrBusyError(err)) {
-              lane.cooldownUntil = Date.now() + 20_000
+              lane.cooldownUntil = Date.now() + 5_000
               queue.push(item)
-              log(scan, 'warn', `Missing-scene finder: Rate limit / API busy on ${lane.model.id} (key ${lane.keyIndex + 1}) — chunk ${chunkIndex + 1} re-queued (cooldown 20s)`)
+              log(scan, 'warn', `Missing-scene finder: Rate limit / Empty response on ${lane.model.id} (key ${lane.keyIndex + 1}) — chunk ${chunkIndex + 1} re-queued (cooldown 5s)`)
             } else {
               item.attempts += 1
-              if (item.attempts < 3) {
+              if (item.attempts < 6) {
                 queue.push(item)
                 log(scan, 'warn', `Missing-scene finder: Chunk ${chunkIndex + 1} attempt ${item.attempts} failed on ${lane.model.id} (key ${lane.keyIndex + 1}) [${e.message.slice(0, 100)}] — auto-retrying on another lane...`)
               } else {
                 request.status = 'failed'
                 request.error = e.message.slice(0, 500)
                 request.finishedAt = Date.now()
-                minute.completedChunks.push(chunkIndex)
                 log(scan, 'error', `Missing-scene minute ${minute.index + 1}, chunk ${chunkIndex + 1} failed after ${item.attempts} attempt(s): ${e.message.slice(0, 120)}`)
               }
             }
@@ -443,6 +447,16 @@ async function runGapBackup(scan: Scan, apiKeys: string[], gaps: ShortRange[], c
       }
 
       await Promise.all(Array.from({ length: CONCURRENCY }, () => processWorker()))
+
+      // Auto-retry pass for unresolved parts if any candidate chunks failed or were skipped
+      if (unresolved().length > 0 && !control.stopping) {
+        const remainingChunks = minute.candidateChunks.filter((chunkIdx) => !minute.completedChunks.includes(chunkIdx))
+        if (remainingChunks.length > 0) {
+          log(scan, 'warn', `Missing-scene minute ${minute.index + 1}: ${unresolved().length} part(s) unresolved — starting auto-retry pass on ${remainingChunks.length} remaining chunk(s)...`)
+          queue.push(...remainingChunks.map((chunkIndex) => ({ chunkIndex, attempts: 0 })))
+          await Promise.all(Array.from({ length: CONCURRENCY }, () => processWorker()))
+        }
+      }
 
       minute.currentBatch = undefined
       for (const partId of unresolved()) {

@@ -42,19 +42,22 @@ interface GeminiResponseLike {
   candidates?: GeminiCandidateLike[]
 }
 
-/** Safely extracts text from a Gemini response, inspecting direct text and candidate text parts. */
+/** Safely extracts text from a Gemini response, inspecting direct text and all candidate text parts. */
 export function extractResponseText(resp: GeminiResponseLike | unknown): string {
   const r = resp as GeminiResponseLike | undefined
   if (typeof r?.text === 'string' && r.text.trim()) {
     return r.text.trim()
   }
-  const candidate = r?.candidates?.[0]
-  if (candidate?.content?.parts && Array.isArray(candidate.content.parts)) {
-    const textParts = candidate.content.parts
-      .map((p) => p?.text)
-      .filter((t): t is string => typeof t === 'string' && t.trim().length > 0)
-    if (textParts.length > 0) {
-      return textParts.join('\n').trim()
+  if (Array.isArray(r?.candidates)) {
+    for (const candidate of r.candidates) {
+      if (candidate?.content?.parts && Array.isArray(candidate.content.parts)) {
+        const textParts = candidate.content.parts
+          .map((p) => p?.text)
+          .filter((t): t is string => typeof t === 'string' && t.trim().length > 0)
+        if (textParts.length > 0) {
+          return textParts.join('\n').trim()
+        }
+      }
     }
   }
   return ''
@@ -140,20 +143,43 @@ export function classifyError(err: unknown): GeminiError {
     return new GeminiError('unavailable', msg)
   }
   const is429 =
-    lower.includes('429') || lower.includes('resource_exhausted') || lower.includes('quota') || lower.includes('rate limit')
+    lower.includes('429') ||
+    lower.includes('resource_exhausted') ||
+    lower.includes('quota') ||
+    lower.includes('rate limit') ||
+    lower.includes('limit:') ||
+    lower.includes('exhausted')
+
   if (is429) {
-    // Distinguish daily quota (RPD) from per-minute (RPM/TPM) limits from the message.
+    // Check if it's explicitly a short per-minute RPM rate limit with no quota/limit: 20 indication
+    const isRpm =
+      (lower.includes('per minute') || lower.includes('requests per minute') || lower.includes('rpm')) &&
+      !lower.includes('limit: 20') &&
+      !lower.includes('free_tier') &&
+      !lower.includes('daily')
+
     if (
-      lower.includes('perday') ||
+      !isRpm ||
+      lower.includes('limit: 20') ||
+      lower.includes('free_tier') ||
       lower.includes('per day') ||
+      lower.includes('perday') ||
       lower.includes('daily') ||
       lower.includes('requests per day') ||
-      lower.includes('generaterequestsperday')
+      lower.includes('generaterequestsperday') ||
+      lower.includes('resource_exhausted') ||
+      lower.includes('resource has been exhausted') ||
+      lower.includes('quota exceeded')
     ) {
       return new GeminiError('rpd', msg)
     }
     return new GeminiError('rate', msg)
   }
+
+  if (lower.includes('empty') && (lower.includes('response') || lower.includes('finder'))) {
+    return new GeminiError('rate', msg)
+  }
+
   return new GeminiError('other', msg)
 }
 
@@ -854,10 +880,13 @@ export async function runGapFinderChunk(
           { text: gapFinderPrompt(parts, chunkStart, chunkEnd) },
         ] as never,
       }],
-      config: GEN_CONFIG,
+      config: {
+        ...GEN_CONFIG,
+        maxOutputTokens: 8192,
+      },
     })
     const text = extractResponseText(resp)
-    if (!text) throw new Error('Empty missing-scene finder response')
+    if (!text) throw new GeminiError('rate', 'Empty missing-scene finder response')
     return { text, tokens: resp.usageMetadata?.totalTokenCount ?? null }
   } catch (err) {
     throw classifyError(err)

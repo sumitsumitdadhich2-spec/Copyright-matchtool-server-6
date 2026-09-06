@@ -5,15 +5,25 @@ import useSWR from 'swr'
 import { KeyRound, Check, ShieldCheck, X, Sparkles, HardDrive } from 'lucide-react'
 import { fetcher } from '@/lib/format'
 
+interface ModelSpecInfo {
+  id: string
+  name: string
+  rpd: number
+  purpose?: string
+}
+
 interface KeySlot {
   index: number
   hasKey: boolean
   maskedKey: string | null
+  usage?: Record<string, number> | null
+  totalRequests?: number
 }
 
 interface SettingsResponse {
   keys: KeySlot[]
   maxKeys: number
+  models?: ModelSpecInfo[]
   twelveLabs?: { hasKey: boolean; maskedKey: string | null }
 }
 
@@ -197,6 +207,54 @@ export function ApiKeyPanel() {
                 </button>
               )}
             </div>
+
+            {/* ---------- Per-Key Daily Usage Tracking ---------- */}
+            {slot.hasKey && (
+              <div className="mt-2.5 rounded-md border border-border/70 bg-card/60 p-2.5 text-xs">
+                <div className="flex items-center justify-between font-medium mb-2">
+                  <div className="flex items-center gap-1.5 text-foreground">
+                    <span className="size-2 rounded-full bg-emerald-500 animate-pulse" aria-hidden />
+                    <span>Daily Model Usage for this Key</span>
+                  </div>
+                  <span className="font-mono text-muted-foreground">
+                    Total: <strong className="text-foreground font-semibold">{slot.totalRequests ?? 0}</strong> reqs
+                  </span>
+                </div>
+                <div className="grid grid-cols-2 sm:grid-cols-3 gap-1.5 font-mono">
+                  {(data?.models ?? [
+                    { id: 'gemini-2.5-flash', name: '2.5 Flash', rpd: 20 },
+                    { id: 'gemini-2.5-pro', name: '2.5 Pro', rpd: 20 },
+                    { id: 'gemini-3-flash', name: '3 Flash', rpd: 20 },
+                    { id: 'gemini-3.5-flash', name: '3.5 Flash', rpd: 20 },
+                    { id: 'gemini-3.5-flash-lite', name: '3.5 Flash-Lite', rpd: 500 },
+                    { id: 'gemini-3.1-flash-lite', name: '3.1 Flash-Lite', rpd: 500 },
+                  ]).map((m) => {
+                    const used = slot.usage?.[m.id] ?? 0
+                    const isExhausted = used >= m.rpd
+                    const isNear = used >= m.rpd * 0.8
+                    return (
+                      <div
+                        key={m.id}
+                        className={`flex items-center justify-between rounded px-2 py-1 border transition-colors ${
+                          isExhausted
+                            ? 'border-destructive/40 bg-destructive/10 text-destructive'
+                            : isNear
+                              ? 'border-warning/40 bg-warning/10 text-warning'
+                              : 'border-border/60 bg-background/60 text-foreground/90'
+                        }`}
+                      >
+                        <span className="truncate pr-1 text-[11px]" title={m.id}>
+                          {m.name || m.id.replace('gemini-', '')}
+                        </span>
+                        <span className="font-semibold text-[11px] shrink-0">
+                          {used}/{m.rpd}
+                        </span>
+                      </div>
+                    )
+                  })}
+                </div>
+              </div>
+            )}
           </div>
         )
       })}

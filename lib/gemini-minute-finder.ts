@@ -757,17 +757,21 @@ async function laneWorker(id: string, ctrl: Ctrl, lane: Lane, env: LaneEnv, pass
     } catch (err) {
       const e = err instanceof GeminiError ? err : classifyError(err)
       if (e.kind === 'invalid_key') {
-        setModelExhausted(lane.model.id, lane.apiKey, lane.model.rpd)
-        lane.dead = true
+        for (const m of CHUNK_MODEL_POOL) {
+          setModelExhausted(m.id, lane.apiKey, m.rpd)
+        }
+        for (const l of lanes) {
+          if (l.apiKey === lane.apiKey) l.dead = true
+        }
         w.status = 'pending'
         queue.push(idx)
-        log(id, 'error', `Key ${lane.keyIdx} is invalid or expired — lane permanently disabled; ${tag.toLowerCase()} #${w.index} re-queued`)
+        log(id, 'error', `Key ${lane.keyIdx} is invalid or expired — all lanes for key ${lane.keyIdx} permanently disabled; ${tag.toLowerCase()} #${w.index} re-queued`)
       } else if (e.kind === 'rpd' || e.kind === 'unavailable') {
         setModelExhausted(lane.model.id, lane.apiKey, lane.model.rpd)
         lane.dead = true
         w.status = 'pending'
         queue.push(idx)
-        log(id, 'warn', `${lane.label}: ${e.kind === 'rpd' ? 'daily quota exhausted' : 'model unavailable'} — lane removed, ${tag.toLowerCase()} #${w.index} re-queued`)
+        log(id, 'warn', `Key ${lane.keyIdx} · ${lane.model.id}: model daily quota exhausted (${lane.model.rpd}/${lane.model.rpd} RPD) — model lane removed, key ${lane.keyIdx}'s other models remain active; ${tag.toLowerCase()} #${w.index} re-queued`)
       } else if (e.kind === 'rate') {
         // 429 RPM/TPM: cooldown, then send the SAME request again (unlimited).
         ctrl.cooldownUntil[rk] = Date.now() + RATE_COOLDOWN_MS

@@ -1351,7 +1351,7 @@ class Scheduler {
           return
         }
         st.state = 'waiting'
-        await sleep(1000)
+        await sleep(150)
         continue
       }
 
@@ -1392,8 +1392,13 @@ class Scheduler {
           addLog(scan, 'error', `Verifier: API Key ${lane.idx} is invalid/expired — permanently disabled; group ${g.id} re-queued for another key`)
         } else if (e.kind === 'rpd' || e.kind === 'unavailable') {
           setModelExhausted(m.id, lane.apiKey, m.rpd)
+          const laneState = job.scan.keyLanes.find((l) => l.idx === lane.idx)
+          if (laneState) {
+            const ms = laneState.models.find((item) => item.id === m.id)
+            if (ms) ms.state = 'exhausted'
+          }
           job.verifyQueue.push(gi) // another (key × model) worker retries the same work
-          addLog(scan, 'warn', `Verifier: ${m.id} (key ${lane.idx}) exhausted — group ${g.id} re-queued for another worker`)
+          addLog(scan, 'warn', `Verifier: ${m.id} (key ${lane.idx}) model daily quota exhausted (${m.rpd}/${m.rpd} RPD) — group ${g.id} re-queued for another worker (key ${lane.idx}'s other models remain active)`)
         } else if (e.kind === 'rate') {
           job.cooldownUntil[this.rateKey(lane, m)] = Date.now() + RATE_COOLDOWN_MS
           job.verifyQueue.push(gi)
@@ -2198,9 +2203,14 @@ class Scheduler {
           addLog(scan, 'error', `API Key ${lane.idx} is invalid/expired — permanently disabled; Chunk ${chunkIndex} re-queued for another key`)
         } else if (e.kind === 'rpd' || e.kind === 'unavailable') {
           setModelExhausted(m.id, lane.apiKey, m.rpd)
+          const laneState = job.scan.keyLanes.find((l) => l.idx === lane.idx)
+          if (laneState) {
+            const ms = laneState.models.find((item) => item.id === m.id)
+            if (ms) ms.state = 'exhausted'
+          }
           chunk.status = 'pending'
           job.queue.push(chunkIndex)
-          addLog(scan, 'warn', `${m.id} (key ${lane.idx}) daily quota exhausted — Chunk ${chunkIndex} re-queued for another key`)
+          addLog(scan, 'warn', `${m.id} (key ${lane.idx}) model daily quota exhausted (${m.rpd}/${m.rpd} RPD) — Chunk ${chunkIndex} re-queued for another worker (key ${lane.idx}'s other models remain active)`)
         } else if (e.kind === 'rate') {
           job.cooldownUntil[this.rateKey(lane, m)] = Date.now() + RATE_COOLDOWN_MS
           chunk.status = 'pending'
