@@ -334,8 +334,12 @@ class Scheduler {
         for (const m of laneState.models) {
           const spec = MODEL_POOL.find((item) => item.id === m.id)
           const usage = getModelUsage(m.id, lane.apiKey)
-          if (m.state === 'exhausted' && spec && usage < spec.rpd) {
-            m.state = 'idle'
+          if (spec) {
+            if (usage < spec.rpd) {
+              if (m.state === 'exhausted') m.state = 'idle'
+            } else {
+              m.state = 'exhausted'
+            }
           }
         }
       }

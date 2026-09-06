@@ -481,7 +481,7 @@ async function run(id: string, ctrl: Ctrl, apiKeys: string[], user: FinderUser):
     throw new Error('Saari lanes ki daily quota (RPD) khatam hai — kal Retry karo ya manual Full scan use karo.')
   }
   const env: LaneEnv = { shortFile, copyPath, trimStart, trimEnd }
-  await Promise.all(lanes.map((lane) => laneWorker(id, ctrl, lane, env, 'normal')))
+  await Promise.all(lanes.map((lane) => laneWorker(id, ctrl, lane, env, 'normal', lanes)))
   if (ctrl.stopping) return
 
   // Windows still pending with every lane dead => failed (all keys exhausted).
@@ -658,7 +658,7 @@ async function sendWindow(
   return { text, tokens, parsed: parseBackupMinuteFinderOutput(text, w.startOffset, w.endOffset, WINDOW_TIMESTAMPS_RELATIVE, parts) }
 }
 
-async function laneWorker(id: string, ctrl: Ctrl, lane: Lane, env: LaneEnv, pass: Pass): Promise<void> {
+async function laneWorker(id: string, ctrl: Ctrl, lane: Lane, env: LaneEnv, pass: Pass, allLanes?: Lane[]): Promise<void> {
   const rk = lane.label
   const tag = pass === 'backup' ? 'Backup window' : 'Window'
   const windowsOf = () => (pass === 'backup' ? ctrl.state.backup?.windows || [] : ctrl.state.windows)
@@ -760,8 +760,12 @@ async function laneWorker(id: string, ctrl: Ctrl, lane: Lane, env: LaneEnv, pass
         for (const m of CHUNK_MODEL_POOL) {
           setModelExhausted(m.id, lane.apiKey, m.rpd)
         }
-        for (const l of lanes) {
-          if (l.apiKey === lane.apiKey) l.dead = true
+        if (allLanes) {
+          for (const l of allLanes) {
+            if (l.apiKey === lane.apiKey) l.dead = true
+          }
+        } else {
+          lane.dead = true
         }
         w.status = 'pending'
         queue.push(idx)
@@ -1016,7 +1020,7 @@ async function runBackupPass(
       .join(' ')} (found range first); ${liveLanes.length} lane(s)`,
   )
 
-  await Promise.all(liveLanes.map((lane) => laneWorker(id, ctrl, lane, env, 'backup')))
+  await Promise.all(liveLanes.map((lane) => laneWorker(id, ctrl, lane, env, 'backup', liveLanes)))
   if (ctrl.stopping) return
 
   for (const w of b.windows) {
