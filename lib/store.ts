@@ -89,6 +89,12 @@ export function apiKeyHash(apiKey: string): string {
 
 const COUNTERS_FILE = path.join(DATA_DIR, 'counters.json')
 
+interface CountersData {
+  _lastActiveDay?: string
+  _lastResetTime?: number
+  [key: string]: number | string | undefined
+}
+
 export function geminiUsageDay(now: Date = new Date()): string {
   const parts = new Intl.DateTimeFormat('en-CA', {
     timeZone: 'America/Los_Angeles',
@@ -104,22 +110,54 @@ function todayKey(): string {
   return geminiUsageDay()
 }
 
+/**
+ * Checks if the calendar date has changed since the last recorded activity.
+ * When a new day starts (at midnight Pacific Time / deployment startup on a new date),
+ * all old day counters and exhausted states are automatically purged and reset to 0.
+ */
+export function checkDailyReset(): boolean {
+  ensureDirs()
+  const counters = readJSON<CountersData>(COUNTERS_FILE, {})
+  const today = todayKey()
+  const lastDay = counters._lastActiveDay
+
+  if (lastDay && lastDay !== today) {
+    console.log(`[Daily Quota Reset] New date detected (${today} vs previous ${lastDay}). Resetting all Gemini daily usage counters to 0.`)
+    const newCounters: CountersData = {
+      _lastActiveDay: today,
+      _lastResetTime: Date.now(),
+    }
+    writeJSON(COUNTERS_FILE, newCounters)
+    return true
+  }
+
+  if (!counters._lastActiveDay) {
+    counters._lastActiveDay = today
+    counters._lastResetTime = Date.now()
+    writeJSON(COUNTERS_FILE, counters)
+  }
+  return false
+}
+
 function counterKey(model: string, apiKey: string): string {
   return `${model}|${todayKey()}|${apiKeyHash(apiKey)}`
 }
 
 export function getModelUsage(model: string, apiKey: string): number {
+  checkDailyReset()
   const counters = readJSON<Record<string, number>>(COUNTERS_FILE, {})
   return counters[counterKey(model, apiKey)] || 0
 }
 
 export function incrementModelUsage(model: string, apiKey: string): number {
+  checkDailyReset()
   const counters = readJSON<Record<string, number>>(COUNTERS_FILE, {})
   const key = counterKey(model, apiKey)
   counters[key] = (counters[key] || 0) + 1
   // prune keys from other days to keep the file small
   const today = todayKey()
   for (const k of Object.keys(counters)) {
+    if (k.startsWith('_')) continue
     if (!k.includes(`|${today}|`)) delete counters[k]
   }
   writeJSON(COUNTERS_FILE, counters)
@@ -127,6 +165,7 @@ export function incrementModelUsage(model: string, apiKey: string): number {
 }
 
 export function setModelExhausted(model: string, apiKey: string, rpd: number) {
+  checkDailyReset()
   // Force the counter to the daily cap so it is treated as exhausted everywhere.
   const counters = readJSON<Record<string, number>>(COUNTERS_FILE, {})
   const key = counterKey(model, apiKey)
@@ -135,6 +174,7 @@ export function setModelExhausted(model: string, apiKey: string, rpd: number) {
 }
 
 export function getAllUsage(apiKey: string): Record<string, number> {
+  checkDailyReset()
   const out: Record<string, number> = {}
   for (const m of MODEL_POOL) out[m.id] = getModelUsage(m.id, apiKey)
   return out

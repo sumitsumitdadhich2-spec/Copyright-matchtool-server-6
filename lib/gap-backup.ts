@@ -2,11 +2,11 @@ import 'server-only'
 
 import fs from 'node:fs'
 import path from 'node:path'
-import { getScan, saveScan, addLog, apiKeyHash, scanMediaDir, getModelUsage, incrementModelUsage } from './store'
+import { getScan, saveScan, addLog, apiKeyHash, scanMediaDir, getModelUsage, incrementModelUsage, setModelExhausted, checkDailyReset, geminiUsageDay } from './store'
 import { ensureLocalMedia, localMediaPath } from './media'
 import { buildBackupClip, chunkPath, extractClipPrecise } from './ffmpeg'
-import { CHUNK_MODEL_POOL } from './models'
-import { deleteFileQuiet, getClient, parseGapFinderOutput, runGapFinderChunk, uploadVideo, type GapFinderPartSpec } from './gemini'
+import { CHUNK_MODEL_POOL, RESCAN_BACKUP_POOL } from './models'
+import { deleteFileQuiet, getClient, parseGapFinderOutput, runGapFinderChunk, uploadVideo, classifyError, GeminiError, type GapFinderPartSpec } from './gemini'
 import { COVERAGE_MIN_GAP_SEC, coverageFromRanges, gapsOf, mergeRanges, shortTotalOf } from './short-coverage'
 import { scheduler } from './scheduler'
 import type { ChunkMatch, GapBackupCandidate, GapBackupMinute, GapBackupPart, GapBackupRequest, GapBackupState, Scan, ShortRange } from './types'
@@ -127,6 +127,10 @@ export function startGapBackup(id: string, apiKeys: string[]) {
   if (!scan.shortDuration || !scan.movieDuration || scan.awaitingTrim) return { ok: false, error: 'Upload both videos and confirm the movie trim first' }
   if (scan.gapBackup?.candidates.some((candidate) => candidate.review === 'pending')) return { ok: false, error: 'Review the pending Gemini candidates before retrying unresolved ranges' }
   if (!apiKeys.length) return { ok: false, error: 'Add a Gemini API key in Settings first' }
+  const isNewDay = checkDailyReset()
+  if (isNewDay) {
+    addLog(scan, 'success', `[Daily Quota Reset] New date detected (${geminiUsageDay()}) — all Gemini daily quotas reset to fresh state.`)
+  }
   const gaps = uncovered(scan)
   if (!gaps.length) return { ok: false, error: 'No true uncovered ranges remain' }
   const control = { stopping: false }
@@ -210,186 +214,233 @@ async function runGapBackup(scan: Scan, apiKeys: string[], gaps: ShortRange[], c
       persist(scan, state)
     }
 
-    const lanes = apiKeys.flatMap((key, keyIndex) => CHUNK_MODEL_POOL
-      .filter((model) => getModelUsage(model.id, key) < model.rpd)
-      .map((model) => ({ key, keyIndex, model, ai: getClient(key), keyId: apiKeyHash(key) })))
-    if (!lanes.length) throw new Error('Saari Gemini chunk-model lanes ki daily quota exhausted hai')
+    interface GapLane {
+      key: string
+      keyIndex: number
+      model: (typeof CHUNK_MODEL_POOL)[number] | (typeof RESCAN_BACKUP_POOL)[number]
+      ai: ReturnType<typeof getClient>
+      keyId: string
+      cooldownUntil: number
+      dead: boolean
+    }
 
-    const uploadJobs = new Map<number, Promise<Map<string, { uri: string; name: string }>>>()
-    const beginMinuteUpload = (minute: GapBackupMinute, foreground: boolean) => {
-      const existing = uploadJobs.get(minute.index)
-      if (existing) return existing
-      minute.status = 'uploading'
-      if (foreground) {
-        state.status = 'uploading'
-        state.progress = `Short minute ${minute.index + 1} upload ho raha hai`
+    const allLanes: GapLane[] = apiKeys.flatMap((key, keyIndex) => [
+      ...CHUNK_MODEL_POOL.map((model) => ({ key, keyIndex, model, ai: getClient(key), keyId: apiKeyHash(key), cooldownUntil: 0, dead: false })),
+      ...RESCAN_BACKUP_POOL.map((model) => ({ key, keyIndex, model, ai: getClient(key), keyId: apiKeyHash(key), cooldownUntil: 0, dead: false })),
+    ])
+
+    const isPrimary = (lane: GapLane) => CHUNK_MODEL_POOL.some((m) => m.id === lane.model.id)
+    const pickLane = (): GapLane | null => {
+      const now = Date.now()
+      // 1. Check if any primary models are available
+      const primaryLanes = allLanes.filter((l) => !l.dead && isPrimary(l) && getModelUsage(l.model.id, l.key) < l.model.rpd && l.cooldownUntil <= now)
+      if (primaryLanes.length > 0) {
+        return primaryLanes[Math.floor(Math.random() * primaryLanes.length)]
       }
-      persist(scan, state)
-      log(scan, 'info', `Missing-scene minute ${minute.index + 1}: uploading prepared clip to ${new Set(lanes.map((lane) => lane.keyId)).size} Gemini key(s)`)
-      const job = (async () => {
-        const uploads = new Map<string, { uri: string; name: string }>()
-        await Promise.all([...new Set(lanes.map((lane) => lane.keyId))].map(async (keyId) => {
-          const lane = lanes.find((item) => item.keyId === keyId)!
-          const upload = await uploadVideo(lane.ai, minute.clip!.path)
-          uploads.set(keyId, upload)
-          uploadedResources.push({ ai: lane.ai, name: upload.name })
-        }))
-        minute.uploadedAt = Date.now()
-        persist(scan, state)
-        return uploads
-      })()
-      uploadJobs.set(minute.index, job)
-      return job
+      // 2. Check if all primary models across all keys are exhausted
+      const anyPrimaryAlive = allLanes.some((l) => !l.dead && isPrimary(l) && getModelUsage(l.model.id, l.key) < l.model.rpd)
+      if (!anyPrimaryAlive) {
+        // Fall back to backup lite pool
+        const backupLanes = allLanes.filter((l) => !l.dead && !isPrimary(l) && getModelUsage(l.model.id, l.key) < l.model.rpd && l.cooldownUntil <= now)
+        if (backupLanes.length > 0) {
+          return backupLanes[Math.floor(Math.random() * backupLanes.length)]
+        }
+      }
+      return null
+    }
+
+    const shortUploadPromises = new Map<string, Promise<{ uri: string; name: string }>>()
+    const getShortUpload = (lane: GapLane, minute: GapBackupMinute) => {
+      const cacheKey = `${minute.index}|${lane.keyId}`
+      let p = shortUploadPromises.get(cacheKey)
+      if (!p) {
+        p = uploadVideo(lane.ai, minute.clip!.path).then((res) => {
+          uploadedResources.push({ ai: lane.ai, name: res.name })
+          return res
+        })
+        shortUploadPromises.set(cacheKey, p)
+      }
+      return p
     }
 
     for (let minutePosition = 0; minutePosition < minutes.length; minutePosition++) {
       const minute = minutes[minutePosition]
       if (control.stopping) break
       if (minute.status === 'failed' || !minute.clip) continue
-      const shortUploads = await beginMinuteUpload(minute, true)
-      if (control.stopping) {
-        for (const [keyId, upload] of shortUploads) {
-          const lane = lanes.find((item) => item.keyId === keyId)
-          if (lane) void deleteFileQuiet(lane.ai, upload.name)
-        }
-        break
-      }
 
       minute.status = 'searching'
       state.status = 'searching'
-      const nextMinute = minutes.slice(minutePosition + 1).find((item) => item.status !== 'failed' && item.clip)
-      if (nextMinute) void beginMinuteUpload(nextMinute, false)
-      log(scan, 'info', `Missing-scene minute ${minute.index + 1}: upload ready; Gemini chunk search started`)
+      log(scan, 'info', `Missing-scene minute ${minute.index + 1}: Gemini chunk search started with auto-retry system`)
       const unresolved = () => minute.partIds.filter((partId) => !state.candidates.some((candidate) => candidate.part === partId && candidate.review !== 'rejected'))
-      const batchSize = Math.min(BATCH_SIZE, lanes.length)
-      for (let offset = 0, batchNumber = 1; offset < minute.candidateChunks.length && unresolved().length; offset += batchSize, batchNumber++) {
-        if (control.stopping) break
-        const batch = minute.candidateChunks.slice(offset, offset + batchSize)
-        minute.currentBatch = batch
-        state.activeBatch = batch
-        state.progress = `Short minute ${minute.index + 1}: batch ${batchNumber}, chunks ${batch.map((value) => value + 1).join(', ')} Gemini par chal rahe hain`
-        const batchRequests = batch.map((chunkIndex, slot) => {
-          const lane = lanes[(offset + slot) % lanes.length]
+
+      interface QueueItem {
+        chunkIndex: number
+        attempts: number
+      }
+
+      const queue: QueueItem[] = minute.candidateChunks.map((chunkIndex) => ({ chunkIndex, attempts: 0 }))
+      const inFlight = new Set<number>()
+      const CONCURRENCY = Math.min(BATCH_SIZE, Math.max(1, apiKeys.length * 2))
+
+      const processWorker = async () => {
+        while (queue.length > 0 && unresolved().length > 0 && !control.stopping) {
+          const item = queue.shift()
+          if (!item) break
+          inFlight.add(item.chunkIndex)
+
+          let lane = pickLane()
+          while (!lane && !control.stopping) {
+            const anyAlive = allLanes.some((l) => !l.dead && getModelUsage(l.model.id, l.key) < l.model.rpd)
+            if (!anyAlive) {
+              log(scan, 'error', 'Missing-scene finder: Saari Gemini chunk-model aur backup lanes ki daily quota exhausted hai')
+              throw new Error('Saari Gemini chunk-model aur fallback lanes ki daily quota exhausted hai')
+            }
+            const cooldowns = allLanes
+              .filter((l) => !l.dead && getModelUsage(l.model.id, l.key) < l.model.rpd && l.cooldownUntil > Date.now())
+              .map((l) => l.cooldownUntil)
+            const waitMs = cooldowns.length > 0 ? Math.max(500, Math.min(...cooldowns) - Date.now()) : 1000
+            await new Promise((r) => setTimeout(r, Math.min(waitMs, 4000)))
+            lane = pickLane()
+          }
+
+          if (control.stopping || !lane) {
+            inFlight.delete(item.chunkIndex)
+            break
+          }
+
+          const chunkIndex = item.chunkIndex
           const chunkStart = (scan.movieTrimStart ?? 0) + chunkIndex * 60
           const chunkEnd = Math.min(scan.movieTrimEnd ?? scan.movieDuration!, chunkStart + 60)
           const request: GapBackupRequest = {
-            id: `${minute.index}-${chunkIndex}-${Date.now()}-${slot}`,
+            id: `${minute.index}-${chunkIndex}-${Date.now()}-${item.attempts}`,
             minuteIndex: minute.index,
-            batch: batchNumber,
+            batch: Math.floor(minute.completedChunks.length / BATCH_SIZE) + 1,
             chunkIndex,
             chunkStart,
             chunkEnd,
             lane: `key ${lane.keyIndex + 1} · ${lane.model.id}`,
             model: lane.model.id,
-            status: 'queued',
+            status: 'uploading',
             queuedAt: Date.now(),
+            startedAt: Date.now(),
           }
           state.requests.push(request)
-          return { chunkIndex, lane, request }
-        })
-        persist(scan, state)
-        log(scan, 'info', `Missing-scene minute ${minute.index + 1}: batch ${batchNumber} dispatched (${batch.length}/4 requests; chunks ${batch.map((value) => value + 1).join(', ')})`)
-
-        await Promise.all(batchRequests.map(async ({ chunkIndex, lane, request }) => {
-          const MAX_503_RETRIES = 5
-          let retryCount = 0
-          let success = false
-          const chunkFile = await ensureChunk(scan, movieFile, chunkIndex)
-
-          while (!success && retryCount <= MAX_503_RETRIES) {
-            if (control.stopping) {
-              request.status = 'cancelled'
-              return
-            }
-            request.status = 'uploading'
-            request.startedAt = Date.now()
-            persist(scan, state)
-            let uploadedName: string | null = null
-            try {
-              const uploaded = await uploadVideo(lane.ai, chunkFile)
-              uploadedName = uploaded.name
-              uploadedResources.push({ ai: lane.ai, name: uploaded.name })
-              request.uploadedAt = Date.now()
-              if (control.stopping) {
-                request.status = 'cancelled'
-                if (uploadedName) void deleteFileQuiet(lane.ai, uploadedName).catch(() => {})
-                return
-              }
-              request.status = 'running'
-              state.requestCount = (state.requestCount || 0) + 1
-              persist(scan, state)
-              incrementModelUsage(lane.model.id, lane.key)
-              const partList = parts.filter((part) => unresolved().includes(part.index))
-              const specs = clipSpecs(partList)
-              const response = await runGapFinderChunk(lane.ai, lane.model.id, shortUploads.get(lane.keyId)!.uri, uploaded.uri, specs, request.chunkStart, request.chunkEnd)
-              const hits = parseGapFinderOutput(response.text, specs, request.chunkStart, request.chunkEnd)
-              request.raw = response.text
-              request.tokens = response.tokens ?? undefined
-              request.matches = hits.length
-              request.status = 'done'
-              state.tokenCount = (state.tokenCount || 0) + (response.tokens || 0)
-              for (const hit of hits) {
-                if (state.candidates.some((candidate) => candidate.part === hit.part && Math.abs(candidate.movieStart - hit.movieStart) < 0.5 && candidate.review !== 'rejected')) continue
-                const targetPart = parts.find((part) => part.index === hit.part)
-                if (!targetPart) continue
-                const candidate: GapBackupCandidate = {
-                  id: `${hit.part}-${chunkIndex}-${Math.round(hit.movieStart * 1000)}`,
-                  part: hit.part,
-                  shortStart: targetPart.gapStart,
-                  shortEnd: targetPart.gapEnd,
-                  movieStart: hit.movieStart,
-                  movieEnd: hit.movieEnd,
-                  source: 'gap-backup',
-                  chunkIndex,
-                  model: lane.model.id,
-                  confidence: 1,
-                  reason: hit.evidence,
-                  review: 'pending',
-                  createdAt: Date.now(),
-                }
-                state.candidates.push(candidate)
-                const part = parts.find((item) => item.index === hit.part)
-                if (part) part.result = 'found'
-              }
-              success = true
-            } catch (error) {
-              const is503 = is503OrBusyError(error)
-              if (is503 && retryCount < MAX_503_RETRIES && !control.stopping) {
-                retryCount++
-                const delayMs = Math.min(2000 * Math.pow(1.5, retryCount - 1), 10000)
-                log(scan, 'warn', `Missing-scene minute ${minute.index + 1}, chunk ${chunkIndex + 1}: Gemini 503 / High demand error. Video re-upload & automatic retry ${retryCount}/${MAX_503_RETRIES} in ${(delayMs / 1000).toFixed(1)}s...`)
-                state.progress = `Minute ${minute.index + 1}, chunk ${chunkIndex + 1}: 503 error, auto-retry ${retryCount}/${MAX_503_RETRIES}...`
-                persist(scan, state)
-                if (uploadedName) {
-                  void deleteFileQuiet(lane.ai, uploadedName).catch(() => {})
-                  uploadedName = null
-                }
-                await new Promise((r) => setTimeout(r, delayMs))
-                continue
-              }
-              request.status = 'failed'
-              request.error = error instanceof Error ? error.message.slice(0, 500) : String(error).slice(0, 500)
-              break
-            } finally {
-              if (uploadedName) void deleteFileQuiet(lane.ai, uploadedName).catch(() => {})
-            }
-          }
-
-          request.finishedAt = Date.now()
-          minute.completedChunks.push(chunkIndex)
+          state.activeBatch = Array.from(inFlight)
+          state.progress = `Minute ${minute.index + 1}: chunk ${chunkIndex + 1} on ${lane.model.id} (key ${lane.keyIndex + 1})`
           persist(scan, state)
-          const outcome = request.status === 'done'
-            ? `${request.matches || 0} strict match(es), ${(request.tokens || 0).toLocaleString()} tokens`
-            : request.error || request.status
-          log(scan, request.status === 'failed' ? 'error' : 'info', `Missing-scene minute ${minute.index + 1}, batch ${batchNumber}, chunk ${chunkIndex + 1}: ${outcome}`)
-        }))
-        const remaining = unresolved().length
-        log(scan, 'info', `Missing-scene minute ${minute.index + 1}: batch ${batchNumber} complete; ${remaining} part(s) still unresolved`)
+
+          let uploadedChunkName: string | null = null
+          try {
+            const chunkFile = await ensureChunk(scan, movieFile, chunkIndex)
+            const [shortRes, chunkRes] = await Promise.all([
+              getShortUpload(lane, minute),
+              uploadVideo(lane.ai, chunkFile),
+            ])
+            uploadedChunkName = chunkRes.name
+            uploadedResources.push({ ai: lane.ai, name: chunkRes.name })
+
+            request.uploadedAt = Date.now()
+            request.status = 'running'
+            state.requestCount = (state.requestCount || 0) + 1
+            persist(scan, state)
+
+            incrementModelUsage(lane.model.id, lane.key)
+
+            const partList = parts.filter((part) => unresolved().includes(part.index))
+            const specs = clipSpecs(partList)
+            const response = await runGapFinderChunk(
+              lane.ai,
+              lane.model.id,
+              shortRes.uri,
+              chunkRes.uri,
+              specs,
+              chunkStart,
+              chunkEnd,
+            )
+
+            const hits = parseGapFinderOutput(response.text, specs, chunkStart, chunkEnd)
+            request.raw = response.text
+            request.tokens = response.tokens ?? undefined
+            request.matches = hits.length
+            request.status = 'done'
+            request.finishedAt = Date.now()
+            state.tokenCount = (state.tokenCount || 0) + (response.tokens || 0)
+
+            for (const hit of hits) {
+              if (state.candidates.some((candidate) => candidate.part === hit.part && Math.abs(candidate.movieStart - hit.movieStart) < 0.5 && candidate.review !== 'rejected')) continue
+              const targetPart = parts.find((part) => part.index === hit.part)
+              if (!targetPart) continue
+              const candidate: GapBackupCandidate = {
+                id: `${hit.part}-${chunkIndex}-${Math.round(hit.movieStart * 1000)}`,
+                part: hit.part,
+                shortStart: targetPart.gapStart,
+                shortEnd: targetPart.gapEnd,
+                movieStart: hit.movieStart,
+                movieEnd: hit.movieEnd,
+                source: 'gap-backup',
+                chunkIndex,
+                model: lane.model.id,
+                confidence: 1,
+                reason: hit.evidence,
+                review: 'pending',
+                createdAt: Date.now(),
+              }
+              state.candidates.push(candidate)
+              const part = parts.find((item) => item.index === hit.part)
+              if (part) part.result = 'found'
+            }
+
+            minute.completedChunks.push(chunkIndex)
+            log(
+              scan,
+              hits.length > 0 ? 'success' : 'info',
+              `Missing-scene minute ${minute.index + 1}, chunk ${chunkIndex + 1}: ${hits.length > 0 ? `${hits.length} strict match(es) found` : 'no matching scene'} on ${lane.model.id} (key ${lane.keyIndex + 1})`,
+            )
+            persist(scan, state)
+          } catch (err) {
+            const e = err instanceof GeminiError ? err : classifyError(err)
+            if (e.kind === 'invalid_key') {
+              lane.dead = true
+              for (const m of [...CHUNK_MODEL_POOL, ...RESCAN_BACKUP_POOL]) {
+                setModelExhausted(m.id, lane.key, m.rpd)
+              }
+              queue.push(item)
+              log(scan, 'error', `Missing-scene finder: Key ${lane.keyIndex + 1} is invalid/expired — permanently disabled; chunk ${chunkIndex + 1} re-queued for another key`)
+            } else if (e.kind === 'rpd' || e.kind === 'unavailable') {
+              setModelExhausted(lane.model.id, lane.key, lane.model.rpd)
+              queue.push(item)
+              log(scan, 'warn', `Missing-scene finder: ${lane.model.id} (key ${lane.keyIndex + 1}) daily quota exhausted (20/20 RPD) — chunk ${chunkIndex + 1} re-queued for another worker`)
+            } else if (e.kind === 'rate' || is503OrBusyError(err)) {
+              lane.cooldownUntil = Date.now() + 20_000
+              queue.push(item)
+              log(scan, 'warn', `Missing-scene finder: Rate limit / API busy on ${lane.model.id} (key ${lane.keyIndex + 1}) — chunk ${chunkIndex + 1} re-queued (cooldown 20s)`)
+            } else {
+              item.attempts += 1
+              if (item.attempts < 3) {
+                queue.push(item)
+                log(scan, 'warn', `Missing-scene finder: Chunk ${chunkIndex + 1} attempt ${item.attempts} failed on ${lane.model.id} (key ${lane.keyIndex + 1}) [${e.message.slice(0, 100)}] — auto-retrying on another lane...`)
+              } else {
+                request.status = 'failed'
+                request.error = e.message.slice(0, 500)
+                request.finishedAt = Date.now()
+                minute.completedChunks.push(chunkIndex)
+                log(scan, 'error', `Missing-scene minute ${minute.index + 1}, chunk ${chunkIndex + 1} failed after ${item.attempts} attempt(s): ${e.message.slice(0, 120)}`)
+              }
+            }
+            persist(scan, state)
+          } finally {
+            if (uploadedChunkName) {
+              void deleteFileQuiet(lane.ai, uploadedChunkName).catch(() => {})
+            }
+            inFlight.delete(item.chunkIndex)
+            state.activeBatch = Array.from(inFlight)
+            persist(scan, state)
+          }
+        }
       }
-      for (const [keyId, upload] of shortUploads) {
-        const lane = lanes.find((item) => item.keyId === keyId)
-        if (lane) void deleteFileQuiet(lane.ai, upload.name)
-      }
+
+      await Promise.all(Array.from({ length: CONCURRENCY }, () => processWorker()))
+
       minute.currentBatch = undefined
       for (const partId of unresolved()) {
         const part = parts.find((item) => item.index === partId)

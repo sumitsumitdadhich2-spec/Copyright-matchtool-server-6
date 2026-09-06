@@ -20,8 +20,9 @@ export const CHUNK_MODEL_POOL: ModelSpec[] = [
 ]
 
 /** VERIFY models (locked): gemini-3.5-flash-lite + gemini-3.1-flash-lite ONLY.
- * Dono ki daily limit bahut high hai (500 RPD each) — 10 API keys ke saath
- * dono models ek saath parallel me verify karte hain. NEVER for chunk mapping. */
+ * Dono ki daily limit 500 RPD each hai — har model ek sath 3 parallel requests handle kar sakta hai.
+ * 1 key par 2 models × 3 requests = 6 parallel requests. 5 keys par = 30 parallel requests.
+ * Clips <= 4s hone ki wajah se TPM 250K cap ke andar safe rehta hai. */
 export const VERIFY_MODEL_POOL: ModelSpec[] = [
   { id: 'gemini-3.5-flash-lite', rpm: 15, rpd: 500 },
   { id: 'gemini-3.1-flash-lite', rpm: 15, rpd: 500 },
@@ -48,15 +49,10 @@ export function isRescanModel(id: string): boolean {
   return RESCAN_MODEL_POOL.some((m) => m.id === id)
 }
 
-/** PADDED-VERIFY models (locked): when a short segment is PADDED (segment < 1.5s),
- * ALL its verify / re-verify requests must run ONLY on these three models —
- * gemini-3-flash-preview, gemini-3.5-flash, gemini-3.5-flash-lite. Other verify
- * models are BANNED for padded clips. Thinking HIGH + max output tokens apply
- * globally (see GEN_CONFIG). Non-padded verifies keep using the full verify pool. */
+/** PADDED-VERIFY models: locked to gemini-3.5-flash-lite and gemini-3.1-flash-lite ONLY. */
 export const PADDED_VERIFY_MODEL_POOL: ModelSpec[] = [
-  { id: 'gemini-3-flash-preview', rpm: 5, rpd: 20 },
-  { id: 'gemini-3.5-flash', rpm: 5, rpd: 20 },
   { id: 'gemini-3.5-flash-lite', rpm: 15, rpd: 500 },
+  { id: 'gemini-3.1-flash-lite', rpm: 15, rpd: 500 },
 ]
 
 /** Is this model allowed to verify PADDED clips? */

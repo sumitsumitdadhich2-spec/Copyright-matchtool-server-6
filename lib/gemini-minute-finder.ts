@@ -743,7 +743,13 @@ async function laneWorker(id: string, ctrl: Ctrl, lane: Lane, env: LaneEnv, pass
       )
     } catch (err) {
       const e = err instanceof GeminiError ? err : classifyError(err)
-      if (e.kind === 'rpd' || e.kind === 'unavailable') {
+      if (e.kind === 'invalid_key') {
+        setModelExhausted(lane.model.id, lane.apiKey, lane.model.rpd)
+        lane.dead = true
+        w.status = 'pending'
+        queue.push(idx)
+        log(id, 'error', `Key ${lane.keyIdx} is invalid or expired — lane permanently disabled; ${tag.toLowerCase()} #${w.index} re-queued`)
+      } else if (e.kind === 'rpd' || e.kind === 'unavailable') {
         setModelExhausted(lane.model.id, lane.apiKey, lane.model.rpd)
         lane.dead = true
         w.status = 'pending'

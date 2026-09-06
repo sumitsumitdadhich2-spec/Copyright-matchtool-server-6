@@ -9,8 +9,6 @@ import {
   RESCAN_MODEL_POOL,
   RESCAN_BACKUP_POOL,
   isRescanModel,
-  PADDED_VERIFY_MODEL_POOL,
-  isPaddedVerifyModel,
   MAX_QUALITY_RETRIES,
   MODEL_MIN_INTERVAL_MS,
   RATE_COOLDOWN_MS,
@@ -25,6 +23,8 @@ import {
   getModelUsage,
   incrementModelUsage,
   setModelExhausted,
+  checkDailyReset,
+  geminiUsageDay,
   scanMediaDir,
 } from './store'
 import { chunkPath, cleanupChunks, cleanupClips, extractClipPrecise, extractSegment, segmentPath } from './ffmpeg'
@@ -77,13 +77,18 @@ interface KeyLane {
   chunkUploads: Map<number, Promise<{ uri: string; name: string }>>
   /** verifier groups currently in flight on THIS key (capped by VERIFY_PER_LANE) */
   verifyActive: number
+  /** verifier groups in flight per model on THIS key (capped by VERIFY_CONCURRENCY_PER_MODEL) */
+  verifyActiveByModel: Map<string, number>
 }
 
-/** Max verifier groups in flight per key at once. Before this cap, 7 keys × 3
- *  verify models + 7 × 2 chunk models = 35 concurrent requests — the "fetch
- *  failed" storms in the logs were connection-level timeouts from that load.
- *  Now: per key = 2 chunk + 1 verify = 3 → 7 keys = 21. */
-const VERIFY_PER_LANE = 1
+/** Concurrency per model on each API key: 3 requests simultaneously.
+ * TPM 250K cap ke andar clips <= 4s hone par token load bohot kam rehta hai,
+ * isliye safe hai aur verify speed kafi fast ho jati hai. */
+const VERIFY_CONCURRENCY_PER_MODEL = 3
+
+/** Max verifier groups in flight per key: 2 models × 3 requests = 6 simultaneous requests per key.
+ * 5 keys hone par = 30 simultaneous verify requests in parallel. */
+const VERIFY_PER_LANE = VERIFY_MODEL_POOL.length * VERIFY_CONCURRENCY_PER_MODEL
 
 interface Job {
   scan: Scan
@@ -137,6 +142,38 @@ function chunkAbsWindow(scan: Scan, chunkIndex: number): { start: number; end: n
 
 class Scheduler {
   jobs = new Map<string, Job>()
+  private dailyResetTimer: ReturnType<typeof setInterval> | null = null
+
+  constructor() {
+    // Periodically check if a new day has arrived (at midnight Pacific Time / new date)
+    this.dailyResetTimer = setInterval(() => {
+      if (checkDailyReset()) {
+        this.onDailyReset()
+      }
+    }, 30_000)
+  }
+
+  /** Called whenever the date rolls over or a new day is detected.
+   * Wakes up any waiting jobs, clears lane exhausted states, and resets cooldowns. */
+  onDailyReset() {
+    for (const [, job] of this.jobs.entries()) {
+      addLog(
+        job.scan,
+        'success',
+        `[Daily Quota Reset] New calendar day detected — all Gemini free-tier daily quotas have reset! Resuming workers with fresh capacity.`,
+      )
+      for (const lane of job.lanes) {
+        const laneState = job.scan.keyLanes.find((l) => l.idx === lane.idx)
+        if (laneState && laneState.status !== 'error') {
+          for (const ms of laneState.models) {
+            if (ms.state === 'exhausted') ms.state = 'idle'
+          }
+        }
+      }
+      job.cooldownUntil = {}
+      this.mark(job)
+    }
+  }
 
   isRunning(scanId: string) {
     return this.jobs.has(scanId)
@@ -240,6 +277,15 @@ class Scheduler {
     scan.currentShortSegment = firstIncomplete.index
     scan.chunks = firstIncomplete.chunks
 
+    const isNewDay = checkDailyReset()
+    if (isNewDay) {
+      addLog(
+        scan,
+        'success',
+        `[Daily Quota Reset] New date detected (${geminiUsageDay()}) — all Gemini daily quotas reset to fresh state.`,
+      )
+    }
+
     if (!Array.isArray(scan.matches)) scan.matches = []
     scan.status = 'scanning'
     scan.error = null
@@ -255,7 +301,30 @@ class Scheduler {
       segUriPromises: new Map(),
       chunkUploads: new Map(),
       verifyActive: 0,
+      verifyActiveByModel: new Map(),
     }))
+
+    // Sync scan.keyLanes: ensure any exhausted model whose daily usage is under RPD is reset to idle
+    if (!Array.isArray(scan.keyLanes)) scan.keyLanes = []
+    for (const lane of lanes) {
+      let laneState = scan.keyLanes.find((l) => l.idx === lane.idx)
+      if (!laneState) {
+        laneState = {
+          idx: lane.idx,
+          status: 'idle',
+          models: MODEL_POOL.map((m) => ({ id: m.id, state: 'idle' })),
+        }
+        scan.keyLanes.push(laneState)
+      } else if (laneState.status !== 'error') {
+        for (const m of laneState.models) {
+          const spec = MODEL_POOL.find((item) => item.id === m.id)
+          const usage = getModelUsage(m.id, lane.apiKey)
+          if (m.state === 'exhausted' && spec && usage < spec.rpd) {
+            m.state = 'idle'
+          }
+        }
+      }
+    }
 
     const minuteNote = segments.length > 1 ? ` across ${segments.length} short minutes (scanned sequentially)` : ''
     addLog(
@@ -459,6 +528,10 @@ class Scheduler {
 
   private rateKey(lane: KeyLane, m: ModelSpec) {
     return `${lane.idx}|${m.id}`
+  }
+
+  private paceSlotKey(lane: KeyLane, m: ModelSpec, slot: number = 0) {
+    return `${lane.idx}|${m.id}|${slot}`
   }
 
   private modelState(job: Job, lane: KeyLane, m: ModelSpec) {
@@ -817,7 +890,11 @@ class Scheduler {
     const startVerifyWorkers = () => {
       const ws: Promise<void>[] = []
       for (const lane of job.lanes) {
-        for (const m of VERIFY_MODEL_POOL) ws.push(this.verifyWorker(job, lane, m))
+        for (const m of VERIFY_MODEL_POOL) {
+          for (let slot = 0; slot < VERIFY_CONCURRENCY_PER_MODEL; slot++) {
+            ws.push(this.verifyWorker(job, lane, m, slot))
+          }
+        }
       }
       verifyPhase = Promise.all(ws)
     }
@@ -1203,15 +1280,15 @@ class Scheduler {
         scan,
         'info',
         logResume
-          ? `Verification resume: ${added} candidate group(s) still pending — queued across ${job.lanes.length} API key(s) × ${VERIFY_MODEL_POOL.length} verify models`
+          ? `Verification resume: ${added} candidate group(s) still pending — queued across ${job.lanes.length} API key(s) × ${VERIFY_MODEL_POOL.length} verify models (${VERIFY_CONCURRENCY_PER_MODEL} req/model in parallel)`
           : `Verify pipeline: ${added} new candidate group(s) queued (${job.verifyQueue.length} waiting, ${job.verifyInFlight.size} in flight) — chunk models keep scanning in parallel`,
       )
       this.mark(job)
     }
   }
 
-  /** One verifier worker per (key lane × model) — pulls whole groups off the queue. */
-  private async verifyWorker(job: Job, lane: KeyLane, m: ModelSpec) {
+  /** One verifier worker per (key lane × model × concurrency slot) — pulls whole groups off the queue. */
+  private async verifyWorker(job: Job, lane: KeyLane, m: ModelSpec, slot: number = 0) {
     const { scan } = job
     while (true) {
       if (job.stopping) return
@@ -1236,12 +1313,13 @@ class Scheduler {
       }
       st.cooldownUntil = null
 
-      // PER-KEY VERIFIER CAP: the 3 verify models on one key take turns instead
-      // of all firing at once (35 → 21 concurrent connections across 7 keys).
-      if (lane.verifyActive >= VERIFY_PER_LANE) {
+      // PER-KEY & PER-MODEL VERIFIER CAP:
+      // 2 models × 3 requests = 6 parallel requests per key (30 requests across 5 keys).
+      const modelActive = lane.verifyActiveByModel?.get(m.id) || 0
+      if (modelActive >= VERIFY_CONCURRENCY_PER_MODEL || lane.verifyActive >= VERIFY_PER_LANE) {
         if (job.verifyQueue.length === 0 && job.verifyInFlight.size === 0 && job.chunkPhaseDone) return
         st.state = 'waiting'
-        await sleep(500)
+        await sleep(250)
         continue
       }
 
@@ -1277,14 +1355,27 @@ class Scheduler {
 
       job.verifyInFlight.add(gi)
       lane.verifyActive++
+      lane.verifyActiveByModel.set(m.id, (lane.verifyActiveByModel.get(m.id) || 0) + 1)
       st.state = 'active'
       this.mark(job)
 
       try {
-        await this.processGroup(job, lane, m, g)
+        await this.processGroup(job, lane, m, g, slot)
       } catch (err) {
         const e = err instanceof GeminiError ? err : classifyError(err)
-        if (e.kind === 'rpd' || e.kind === 'unavailable') {
+        if (e.kind === 'invalid_key') {
+          for (const mm of MODEL_POOL) {
+            setModelExhausted(mm.id, lane.apiKey, mm.rpd)
+          }
+          const laneState = job.scan.keyLanes.find((l) => l.idx === lane.idx)
+          if (laneState) {
+            laneState.status = 'error'
+            laneState.lastError = 'API key invalid or expired'
+            for (const ms of laneState.models) ms.state = 'exhausted'
+          }
+          job.verifyQueue.push(gi)
+          addLog(scan, 'error', `Verifier: API Key ${lane.idx} is invalid/expired — permanently disabled; group ${g.id} re-queued for another key`)
+        } else if (e.kind === 'rpd' || e.kind === 'unavailable') {
           setModelExhausted(m.id, lane.apiKey, m.rpd)
           job.verifyQueue.push(gi) // another (key × model) worker retries the same work
           addLog(scan, 'warn', `Verifier: ${m.id} (key ${lane.idx}) exhausted — group ${g.id} re-queued for another worker`)
@@ -1307,7 +1398,9 @@ class Scheduler {
       } finally {
         job.verifyInFlight.delete(gi)
         lane.verifyActive = Math.max(0, lane.verifyActive - 1)
-        if (st.state === 'active') st.state = 'idle'
+        const rem = Math.max(0, (lane.verifyActiveByModel.get(m.id) || 1) - 1)
+        lane.verifyActiveByModel.set(m.id, rem)
+        if (rem === 0 && st.state === 'active') st.state = 'idle'
         this.mark(job)
       }
     }
@@ -1369,14 +1462,21 @@ class Scheduler {
     )
   }
 
-  /** Pace + count one verifier/rescan request on this (key × model) lane.
+  /** Pace + count one verifier/rescan request on this (key × model × slot) lane.
    *  Pacing is sized from the ACTUAL video seconds so small verify clips only
    *  wait seconds while full 1-minute rescans wait the whole minute — full TPM capacity. */
-  private async paceAndSend<T>(job: Job, lane: KeyLane, m: ModelSpec, videoSeconds: number, fn: () => Promise<T>): Promise<T> {
+  private async paceAndSend<T>(
+    job: Job,
+    lane: KeyLane,
+    m: ModelSpec,
+    videoSeconds: number,
+    fn: () => Promise<T>,
+    slot: number = 0,
+  ): Promise<T> {
     if (getModelUsage(m.id, lane.apiKey) >= m.rpd) throw new GeminiError('rpd', `${m.id} daily cap reached`)
-    const rk = this.rateKey(lane, m)
+    const pk = this.paceSlotKey(lane, m, slot)
     const st = this.modelState(job, lane, m)
-    const wait = (job.nextFreeAt[rk] || 0) - Date.now()
+    const wait = (job.nextFreeAt[pk] || 0) - Date.now()
     if (wait > 0) {
       st.state = 'waiting'
       this.mark(job)
@@ -1386,7 +1486,7 @@ class Scheduler {
     // bina attempt-penalty ke re-queue hota hai aur worker loop stopping par exit karta hai.
     if (job.stopping) throw new GeminiError('rate', 'Stop requested — request cancelled before send')
     st.state = 'active'
-    job.nextFreeAt[rk] = Date.now() + pacingIntervalMs(videoSeconds)
+    job.nextFreeAt[pk] = Date.now() + pacingIntervalMs(videoSeconds)
     st.usedToday = incrementModelUsage(m.id, lane.apiKey)
     this.mark(job)
     return fn()
@@ -1438,7 +1538,7 @@ class Scheduler {
 
   /** Full verify → rescan → re-verify pipeline for ONE candidate group.
    *  All clips are cut with millisecond precision and sent to Gemini at 24 fps. */
-  private async processGroup(job: Job, lane: KeyLane, m: ModelSpec, g: CandidateGroup) {
+  private async processGroup(job: Job, lane: KeyLane, m: ModelSpec, g: CandidateGroup, slot: number = 0) {
     const { scan } = job
     const mediaDir = scanMediaDir(scan.id)
     const clipsDir = path.join(mediaDir, 'clips')
@@ -1466,20 +1566,18 @@ class Scheduler {
       ? `IMPORTANT — PADDING NOTE (dhyan se padho):\nVideo 1 me asli TARGET SEGMENT sirf ${ts(tgtStart)} se ${ts(tgtEnd)} tak hai (Video 1 ki apni clock par). Uske pehle aur baad ka content sirf PADDING hai — context ke liye joda gaya hai. HISSA 1 me poora Video 1 map karo, lekin MATCH sirf TARGET window ${ts(tgtStart)}–${ts(tgtEnd)} ke liye do — matched movie window ki duration EXACTLY ${segDur.toFixed(3)}s honi chahiye (padding wali duration NAHI).`
       : undefined
 
-    // PADDED clips are LOCKED to gemini-3-flash-preview / gemini-3.5-flash /
-    // gemini-3.5-flash-lite for EVERY verify request (thinking HIGH is global).
-    // Use the worker's own model when it is one of the three, otherwise pick an
-    // available padded-verify model on this key. Non-padded verifies keep `m`.
+    // VERIFY models: gemini-3.5-flash-lite + gemini-3.1-flash-lite ONLY (500 RPD each).
+    // Use worker's assigned model m if within daily quota; otherwise fallback to other verify model.
     const pickVerifyModel = (): ModelSpec => {
-      if (!needsPad || isPaddedVerifyModel(m.id)) return m
-      const vm = PADDED_VERIFY_MODEL_POOL.find((x) => getModelUsage(x.id, lane.apiKey) < x.rpd)
-      if (!vm) {
+      if (getModelUsage(m.id, lane.apiKey) < m.rpd) return m
+      const fallback = VERIFY_MODEL_POOL.find((x) => getModelUsage(x.id, lane.apiKey) < x.rpd)
+      if (!fallback) {
         throw new GeminiError(
           'other',
-          `Padded-verify models (${PADDED_VERIFY_MODEL_POOL.map((x) => x.id).join(', ')}) exhausted on key ${lane.idx} — group re-queued for another key`,
+          `Verify models (${VERIFY_MODEL_POOL.map((x) => x.id).join(', ')}) exhausted on key ${lane.idx} — group re-queued for another key`,
         )
       }
-      return vm
+      return fallback
     }
 
     g.status = 'verifying'
@@ -1510,18 +1608,24 @@ class Scheduler {
         uploadedNames.push(movieClip.name)
 
         const vm = pickVerifyModel()
-        addLog(scan, 'info', `Verify: short ${ts(g.shortStart)}���${ts(g.shortEnd)} vs movie ${ts(c.movieStart)}–${ts(c.movieEnd)}${needsPad ? ' (padded)' : ''} on ${vm.id} (key ${lane.idx})`)
+        addLog(scan, 'info', `Verify: short ${ts(g.shortStart)}–${ts(g.shortEnd)} vs movie ${ts(c.movieStart)}–${ts(c.movieEnd)}${needsPad ? ' (padded)' : ''} on ${vm.id} (key ${lane.idx})`)
         const clipSecs = shortDur + padBefore + padAfter + Math.max(1, c.movieEnd - c.movieStart) + padBefore + padAfter
-        const raw = await this.paceAndSend(job, lane, vm, clipSecs, () =>
-          this.sendWithClipBackup(
-            job,
-            lane,
-            movieClipFile,
-            movieClip.uri,
-            uploadedNames,
-            (uri) => verifyRequest(lane.ai, vm.id, shortClip.uri, uri, verifyPadNote),
-            `Verify short ${ts(g.shortStart)}–${ts(g.shortEnd)} on ${vm.id} (key ${lane.idx})`,
-          ),
+        const raw = await this.paceAndSend(
+          job,
+          lane,
+          vm,
+          clipSecs,
+          () =>
+            this.sendWithClipBackup(
+              job,
+              lane,
+              movieClipFile,
+              movieClip.uri,
+              uploadedNames,
+              (uri) => verifyRequest(lane.ai, vm.id, shortClip.uri, uri, verifyPadNote),
+              `Verify short ${ts(g.shortStart)}–${ts(g.shortEnd)} on ${vm.id} (key ${lane.idx})`,
+            ),
+          slot,
         )
         const v = parseVerdict(raw)
         if (!v) throw new GeminiError('other', 'Verifier gave no clear VERDICT line')
@@ -1604,16 +1708,22 @@ class Scheduler {
               : undefined
 
           addLog(scan, 'info', `Rescan: hunting short ${ts(g.shortStart)}–${ts(g.shortEnd)} inside full chunk ${c.chunkIndex} on ${rm.id} (key ${lane.idx})${rescanHintNote ? ` — hint region ${ts(hintLocalStart)}–${ts(hintLocalEnd)} pehle check hoga` : ''}`)
-          const raw = await this.paceAndSend(job, lane, rm, shortDur + padBefore + padAfter + (chunkEnd - chunkStart), () =>
-            this.sendWithClipBackup(
-              job,
-              lane,
-              chunkFile,
-              chunkUp.uri,
-              uploadedNames,
-              (uri) => rescanRequest(lane.ai, rm.id, shortClip.uri, uri, rescanPadNote, rescanHintNote),
-              `Rescan chunk ${c.chunkIndex} on ${rm.id} (key ${lane.idx})`,
-            ),
+          const raw = await this.paceAndSend(
+            job,
+            lane,
+            rm,
+            shortDur + padBefore + padAfter + (chunkEnd - chunkStart),
+            () =>
+              this.sendWithClipBackup(
+                job,
+                lane,
+                chunkFile,
+                chunkUp.uri,
+                uploadedNames,
+                (uri) => rescanRequest(lane.ai, rm.id, shortClip.uri, uri, rescanPadNote, rescanHintNote),
+                `Rescan chunk ${c.chunkIndex} on ${rm.id} (key ${lane.idx})`,
+              ),
+            slot,
           )
           const found = parseRescanMatch(raw)
           if (!found) {
@@ -1639,16 +1749,22 @@ class Scheduler {
         const rvm = pickVerifyModel()
         addLog(scan, 'info', `Re-verify rescan window movie ${ts(c.rescanMovieStart!)}–${ts(c.rescanMovieEnd!)}${needsPad ? ' (padded)' : ''} on ${rvm.id} (key ${lane.idx})`)
         const reSecs = shortDur + padBefore + padAfter + Math.max(1, c.rescanMovieEnd! - c.rescanMovieStart!) + padBefore + padAfter
-        const raw2 = await this.paceAndSend(job, lane, rvm, reSecs, () =>
-          this.sendWithClipBackup(
-            job,
-            lane,
-            reFile,
-            reUp.uri,
-            uploadedNames,
-            (uri) => verifyRequest(lane.ai, rvm.id, shortClip.uri, uri, verifyPadNote),
-            `Re-verify rescan window on ${rvm.id} (key ${lane.idx})`,
-          ),
+        const raw2 = await this.paceAndSend(
+          job,
+          lane,
+          rvm,
+          reSecs,
+          () =>
+            this.sendWithClipBackup(
+              job,
+              lane,
+              reFile,
+              reUp.uri,
+              uploadedNames,
+              (uri) => verifyRequest(lane.ai, rvm.id, shortClip.uri, uri, verifyPadNote),
+              `Re-verify rescan window on ${rvm.id} (key ${lane.idx})`,
+            ),
+          slot,
         )
         const v2 = parseVerdict(raw2)
         if (!v2) throw new GeminiError('other', 'Verifier gave no clear VERDICT line (rescan window)')
@@ -2050,21 +2166,41 @@ class Scheduler {
         this.mark(job)
       } catch (err) {
         const e = err instanceof GeminiError ? err : classifyError(err)
-        chunk.attempts += 1
-        if (e.kind === 'rpd' || e.kind === 'unavailable') {
-          setModelExhausted(m.id, lane.apiKey, m.rpd)
-        } else if (e.kind === 'rate') {
-          job.cooldownUntil[this.rateKey(lane, m)] = Date.now() + RATE_COOLDOWN_MS
-        }
-        if (chunk.attempts >= MAX_CHUNK_ATTEMPTS) {
-          chunk.status = 'failed'
-          addLog(scan, 'error', `${minutePrefix}Chunk ${chunkIndex} failed after ${chunk.attempts} attempt(s): ${e.message.slice(0, 140)}`)
-        } else {
+        if (e.kind === 'invalid_key') {
+          for (const mm of MODEL_POOL) {
+            setModelExhausted(mm.id, lane.apiKey, mm.rpd)
+          }
+          const laneState = job.scan.keyLanes.find((l) => l.idx === lane.idx)
+          if (laneState) {
+            laneState.status = 'error'
+            laneState.lastError = 'API key invalid or expired'
+            for (const ms of laneState.models) ms.state = 'exhausted'
+          }
           chunk.status = 'pending'
           job.queue.push(chunkIndex)
-          addLog(scan, 'warn', `Chunk ${chunkIndex} attempt ${chunk.attempts} failed on ${m.id} (key ${lane.idx}) �� re-queued: ${e.message.slice(0, 120)}`)
+          addLog(scan, 'error', `API Key ${lane.idx} is invalid/expired — permanently disabled; Chunk ${chunkIndex} re-queued for another key`)
+        } else if (e.kind === 'rpd' || e.kind === 'unavailable') {
+          setModelExhausted(m.id, lane.apiKey, m.rpd)
+          chunk.status = 'pending'
+          job.queue.push(chunkIndex)
+          addLog(scan, 'warn', `${m.id} (key ${lane.idx}) daily quota exhausted — Chunk ${chunkIndex} re-queued for another key`)
+        } else if (e.kind === 'rate') {
+          job.cooldownUntil[this.rateKey(lane, m)] = Date.now() + RATE_COOLDOWN_MS
+          chunk.status = 'pending'
+          job.queue.push(chunkIndex)
+          addLog(scan, 'warn', `Rate limit on ${m.id} (key ${lane.idx}) — Chunk ${chunkIndex} re-queued`)
+        } else {
+          chunk.attempts += 1
+          if (chunk.attempts >= MAX_CHUNK_ATTEMPTS) {
+            chunk.status = 'failed'
+            addLog(scan, 'error', `${minutePrefix}Chunk ${chunkIndex} failed after ${chunk.attempts} attempt(s): ${e.message.slice(0, 140)}`)
+          } else {
+            chunk.status = 'pending'
+            job.queue.push(chunkIndex)
+            addLog(scan, 'warn', `Chunk ${chunkIndex} attempt ${chunk.attempts} failed on ${m.id} (key ${lane.idx}) — re-queued: ${e.message.slice(0, 120)}`)
+          }
         }
-        this.mark(job)
+          this.mark(job)
       } finally {
         // The short video is reused across chunks; the chunk upload is one-shot.
         if (chunkFileName) void deleteFileQuiet(lane.ai, chunkFileName)

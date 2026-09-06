@@ -1,19 +1,23 @@
-import { GoogleGenAI, ThinkingLevel } from '@google/genai'
+import { GoogleGenAI, ThinkingLevel, HarmCategory, HarmBlockThreshold } from '@google/genai'
 import { SCAN_FPS, MAX_OUTPUT_TOKENS } from './models'
 import type { ChunkMatch } from './types'
 
 /** Shared generation config for EVERY request:
- * thinking level HIGH + max output tokens, always. */
+ * thinking level HIGH + max output tokens + BLOCK_NONE safety thresholds to prevent false safety blocks. */
 const GEN_CONFIG = {
   temperature: 0,
   maxOutputTokens: MAX_OUTPUT_TOKENS,
   thinkingConfig: { thinkingLevel: ThinkingLevel.HIGH },
-  // DEFAULT media resolution only (~65 tok/frame, measured). Never set
-  // mediaResolution: LOW/MEDIUM behave the same as default, and HIGH
-  // quadruples cost to ~257 tok/frame.
+  safetySettings: [
+    { category: HarmCategory.HARM_CATEGORY_HARASSMENT, threshold: HarmBlockThreshold.BLOCK_NONE },
+    { category: HarmCategory.HARM_CATEGORY_HATE_SPEECH, threshold: HarmBlockThreshold.BLOCK_NONE },
+    { category: HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT, threshold: HarmBlockThreshold.BLOCK_NONE },
+    { category: HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT, threshold: HarmBlockThreshold.BLOCK_NONE },
+    { category: HarmCategory.HARM_CATEGORY_CIVIC_INTEGRITY, threshold: HarmBlockThreshold.BLOCK_NONE },
+  ],
 } as const
 
-export type GeminiErrorKind = 'rpd' | 'rate' | 'unavailable' | 'other'
+export type GeminiErrorKind = 'rpd' | 'rate' | 'unavailable' | 'invalid_key' | 'other'
 
 export class GeminiError extends Error {
   kind: GeminiErrorKind
@@ -21,6 +25,39 @@ export class GeminiError extends Error {
     super(message)
     this.kind = kind
   }
+}
+
+interface GeminiPartLike {
+  text?: string
+}
+
+interface GeminiCandidateLike {
+  content?: {
+    parts?: GeminiPartLike[]
+  }
+}
+
+interface GeminiResponseLike {
+  text?: string | null
+  candidates?: GeminiCandidateLike[]
+}
+
+/** Safely extracts text from a Gemini response, inspecting direct text and candidate text parts. */
+export function extractResponseText(resp: GeminiResponseLike | unknown): string {
+  const r = resp as GeminiResponseLike | undefined
+  if (typeof r?.text === 'string' && r.text.trim()) {
+    return r.text.trim()
+  }
+  const candidate = r?.candidates?.[0]
+  if (candidate?.content?.parts && Array.isArray(candidate.content.parts)) {
+    const textParts = candidate.content.parts
+      .map((p) => p?.text)
+      .filter((t): t is string => typeof t === 'string' && t.trim().length > 0)
+    if (textParts.length > 0) {
+      return textParts.join('\n').trim()
+    }
+  }
+  return ''
 }
 
 export function getClient(apiKey: string): GoogleGenAI {
@@ -54,6 +91,16 @@ export function classifyError(err: unknown): GeminiError {
   if (err instanceof GeminiError) return err
   const msg = err instanceof Error ? err.message : String(err)
   const lower = msg.toLowerCase()
+  // Invalid or expired API Key — must disable the lane immediately and not count attempts against the item.
+  if (
+    lower.includes('api key not valid') ||
+    lower.includes('api_key_invalid') ||
+    lower.includes('invalid api key') ||
+    lower.includes('key expired') ||
+    (lower.includes('invalid_argument') && lower.includes('api key'))
+  ) {
+    return new GeminiError('invalid_key', msg)
+  }
   // Model retired / not accessible for this API key — permanently remove from pool for the day.
   if (
     lower.includes('no longer available') ||
@@ -243,7 +290,7 @@ export async function runMinuteFinderWindow(
       ],
       config: GEN_CONFIG,
     })
-    const text = resp.text
+    const text = extractResponseText(resp)
     if (!text) throw new Error('Empty minute-finder response')
     const tokens = resp.usageMetadata?.totalTokenCount ?? null
     return { text, tokens }
@@ -404,7 +451,7 @@ export async function runBackupMinuteFinderWindow(
       ],
       config: GEN_CONFIG,
     })
-    const text = resp.text
+    const text = extractResponseText(resp)
     if (!text) throw new Error('Empty backup minute-finder response')
     const tokens = resp.usageMetadata?.totalTokenCount ?? null
     return { text, tokens }
@@ -676,7 +723,7 @@ export async function mapChunkRequest(
       ],
       config: GEN_CONFIG,
     })
-    const text = resp.text
+    const text = extractResponseText(resp)
     if (!text) throw new Error('Empty model response')
     return text
   } catch (err) {
@@ -778,7 +825,7 @@ export async function runGapFinderChunk(
       }],
       config: GEN_CONFIG,
     })
-    const text = resp.text
+    const text = extractResponseText(resp)
     if (!text) throw new Error('Empty missing-scene finder response')
     return { text, tokens: resp.usageMetadata?.totalTokenCount ?? null }
   } catch (err) {
@@ -961,7 +1008,7 @@ export async function verifyRequest(
       ],
       config: GEN_CONFIG,
     })
-    const text = resp.text
+    const text = extractResponseText(resp)
     if (!text) throw new Error('Empty verifier response')
     return text
   } catch (err) {
@@ -998,7 +1045,7 @@ export async function rescanRequest(
       ],
       config: GEN_CONFIG,
     })
-    const text = resp.text
+    const text = extractResponseText(resp)
     if (!text) throw new Error('Empty rescan response')
     return text
   } catch (err) {
