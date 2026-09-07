@@ -14,6 +14,7 @@ import { buildBackupClip, chunkPath, extractClipPrecise } from './ffmpeg'
 import { localMediaPath, findAndReusePrescanMovie, findReusableGeminiMovieUpload, findAndReuseMovieChunks } from './media'
 import { addLog, getScan, saveScan, scanMediaDir } from './store'
 import { gapsOf, mergeRanges } from './short-coverage'
+import { globalGeminiCoordinator } from './global-gemini-coordinator'
 import type { ChunkMatch, MissingSceneCandidate, MissingSceneScanState, MissingSceneTarget, MissingSceneWindowHit, Scan } from './types'
 
 const MINUTE_FINDER_WINDOW_SEC = 20 * 60 // 20 minutes
@@ -287,10 +288,32 @@ PART <n>: NOT FOUND — not in this 20-minute window`
       state.progress = `Scanning ${winLabel} (${completedWindows + 1}/${windowsToScan.length})...`
       saveScan(scan)
 
+      let releaseGlobalLock: ((sec?: number) => void) | null = null
       try {
-        const model = CHUNK_MODEL_POOL[0]?.id || 'gemini-2.5-flash'
-        const resp = await ai.models.generateContent({
-          model,
+        const apiKeys = scan.apiKeys && scan.apiKeys.length > 0 ? scan.apiKeys : [primaryApiKey]
+        const candLanes = apiKeys.flatMap((k, ki) =>
+          CHUNK_MODEL_POOL.map((m) => ({
+            apiKey: k,
+            keyIdx: ki + 1,
+            modelId: m.id,
+            rpd: m.rpd,
+          })),
+        )
+
+        const { selected, release } = await globalGeminiCoordinator.acquireFirstAvailableLane({
+          scanId,
+          scanTitle: scan.shortName || scanId,
+          candidates: candLanes,
+          operation: `Missing Scene ${winLabel}`,
+          videoSeconds: 60,
+          onWait: (msg) => addLog(scan, 'info', msg),
+          isStopping: () => ctrl.stopping,
+        })
+        releaseGlobalLock = release
+
+        const runnerAi = selected.apiKey === primaryApiKey ? ai : new GoogleGenAI({ apiKey: selected.apiKey })
+        const resp = await runnerAi.models.generateContent({
+          model: selected.modelId,
           contents: [
             {
               role: 'user',
@@ -362,6 +385,8 @@ PART <n>: NOT FOUND — not in this 20-minute window`
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err)
         addLog(scan, 'warn', `[Missing Scene Finder] ${winLabel} failed: ${msg.slice(0, 120)}`)
+      } finally {
+        if (releaseGlobalLock) releaseGlobalLock(60)
       }
     }
 
@@ -424,67 +449,93 @@ Short mm:ss.mmm - mm:ss.mmm --> Movie mm:ss.mmm - mm:ss.mmm
 or:
 Short mm:ss.mmm - mm:ss.mmm --> NOT FOUND`
 
-        const model = CHUNK_MODEL_POOL[0]?.id || 'gemini-2.5-flash'
-        const resp = await ai.models.generateContent({
-          model,
-          contents: [
-            {
-              role: 'user',
-              parts: [
-                { fileData: { fileUri: clipUpload.uri, mimeType: 'video/mp4' }, videoMetadata: { fps: 10 } },
-                { fileData: { fileUri: up.uri, mimeType: 'video/mp4' }, videoMetadata: { fps: 10 } },
-                { text: chunkPrompt },
-              ],
-            },
-          ],
-        })
+        let releaseChunkLock: ((sec?: number) => void) | null = null
+        try {
+          const apiKeys = scan.apiKeys && scan.apiKeys.length > 0 ? scan.apiKeys : [primaryApiKey]
+          const candLanes = apiKeys.flatMap((k, ki) =>
+            CHUNK_MODEL_POOL.map((m) => ({
+              apiKey: k,
+              keyIdx: ki + 1,
+              modelId: m.id,
+              rpd: m.rpd,
+            })),
+          )
 
-        const cText = resp.text || ''
-        const mapRegex = /(\d{1,2}:\d{2}(?:\.\d+)?)\s*-\s*(\d{1,2}:\d{2}(?:\.\d+)?)\s*-->\s*(?:Movie\s*)?(\d{1,2}:\d{2}(?:\.\d+)?)\s*-\s*(\d{1,2}:\d{2}(?:\.\d+)?)/gi
-        let match: RegExpExecArray | null
+          const { selected, release } = await globalGeminiCoordinator.acquireFirstAvailableLane({
+            scanId,
+            scanTitle: scan.shortName || scanId,
+            candidates: candLanes,
+            operation: `Missing Scene Chunk ${chunkIdx + 1} Map`,
+            videoSeconds: 60,
+            onWait: (msg) => addLog(scan, 'info', msg),
+            isStopping: () => ctrl.stopping,
+          })
+          releaseChunkLock = release
 
-        while ((match = mapRegex.exec(cText)) !== null) {
-          const s1 = parseTs(match[1])
-          const s2 = parseTs(match[2])
-          const m1 = parseTs(match[3])
-          const m2 = parseTs(match[4])
+          const runnerAi = selected.apiKey === primaryApiKey ? ai : new GoogleGenAI({ apiKey: selected.apiKey })
+          const resp = await runnerAi.models.generateContent({
+            model: selected.modelId,
+            contents: [
+              {
+                role: 'user',
+                parts: [
+                  { fileData: { fileUri: clipUpload.uri, mimeType: 'video/mp4' }, videoMetadata: { fps: 10 } },
+                  { fileData: { fileUri: up.uri, mimeType: 'video/mp4' }, videoMetadata: { fps: 10 } },
+                  { text: chunkPrompt },
+                ],
+              },
+            ],
+          })
 
-          if (s1 !== null && s2 !== null && m1 !== null && m2 !== null) {
-            // Find which target scene this corresponds to
-            let matchedTarget = targets[0]
-            for (const sp of sceneParts) {
-              if (s1 >= sp.clipStart - 1 && s1 <= sp.clipEnd + 1) {
-                matchedTarget = sp.target
-                break
+          const cText = resp.text || ''
+          const mapRegex = /(\d{1,2}:\d{2}(?:\.\d+)?)\s*-\s*(\d{1,2}:\d{2}(?:\.\d+)?)\s*-->\s*(?:Movie\s*)?(\d{1,2}:\d{2}(?:\.\d+)?)\s*-\s*(\d{1,2}:\d{2}(?:\.\d+)?)/gi
+          let match: RegExpExecArray | null
+
+          while ((match = mapRegex.exec(cText)) !== null) {
+            const s1 = parseTs(match[1])
+            const s2 = parseTs(match[2])
+            const m1 = parseTs(match[3])
+            const m2 = parseTs(match[4])
+
+            if (s1 !== null && s2 !== null && m1 !== null && m2 !== null) {
+              // Find which target scene this corresponds to
+              let matchedTarget = targets[0]
+              for (const sp of sceneParts) {
+                if (s1 >= sp.clipStart - 1 && s1 <= sp.clipEnd + 1) {
+                  matchedTarget = sp.target
+                  break
+                }
               }
-            }
 
-            const absShortStart = matchedTarget.shortStart + (s1 - (matchedTarget.clipStart || 0))
-            const absShortEnd = matchedTarget.shortStart + (s2 - (matchedTarget.clipStart || 0))
-            const absMovieStart = chunkStart + m1
-            const absMovieEnd = chunkStart + m2
+              const absShortStart = matchedTarget.shortStart + (s1 - (matchedTarget.clipStart || 0))
+              const absShortEnd = matchedTarget.shortStart + (s2 - (matchedTarget.clipStart || 0))
+              const absMovieStart = chunkStart + m1
+              const absMovieEnd = chunkStart + m2
 
-            const cand: MissingSceneCandidate = {
-              id: `missing-cand-${chunkIdx}-${Date.now()}-${candidates.length}`,
-              sceneId: matchedTarget.id,
-              shortStart: Math.max(0, Number(absShortStart.toFixed(3))),
-              shortEnd: Number(absShortEnd.toFixed(3)),
-              movieMinute: minute,
-              chunkIndex: chunkIdx,
-              movieStart: Math.max(0, Number(absMovieStart.toFixed(3))),
-              movieEnd: Number(absMovieEnd.toFixed(3)),
-              model,
-              status: 'pending',
+              const cand: MissingSceneCandidate = {
+                id: `missing-cand-${chunkIdx}-${Date.now()}-${candidates.length}`,
+                sceneId: matchedTarget.id,
+                shortStart: Math.max(0, Number(absShortStart.toFixed(3))),
+                shortEnd: Number(absShortEnd.toFixed(3)),
+                movieMinute: minute,
+                chunkIndex: chunkIdx,
+                movieStart: Math.max(0, Number(absMovieStart.toFixed(3))),
+                movieEnd: Number(absMovieEnd.toFixed(3)),
+                model,
+                status: 'pending',
+              }
+              candidates.push(cand)
+              state.candidates = [...candidates]
+              saveScan(scan)
+              addLog(
+                scan,
+                'info',
+                `[Missing Scene Finder] Chunk ${chunkIdx + 1} match candidate: Short ${fmtTime(cand.shortStart)}–${fmtTime(cand.shortEnd)} --> Movie ${fmtTime(cand.movieStart)}–${fmtTime(cand.movieEnd)}`,
+              )
             }
-            candidates.push(cand)
-            state.candidates = [...candidates]
-            saveScan(scan)
-            addLog(
-              scan,
-              'info',
-              `[Missing Scene Finder] Chunk ${chunkIdx + 1} match candidate: Short ${fmtTime(cand.shortStart)}–${fmtTime(cand.shortEnd)} --> Movie ${fmtTime(cand.movieStart)}–${fmtTime(cand.movieEnd)}`,
-            )
           }
+        } finally {
+          if (releaseChunkLock) releaseChunkLock(60)
         }
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err)
@@ -519,53 +570,80 @@ Short mm:ss.mmm - mm:ss.mmm --> NOT FOUND`
           const upMovie = await uploadVideo(ai, vMovieClip, `Verify Movie ${cand.id}`)
           uploadedFilesToClean.push(upShort.name, upMovie.name)
 
-          const vModel = VERIFY_MODEL_POOL[0]?.id || 'gemini-2.5-flash'
-          const vResp = await verifyRequest(ai, vModel, upShort.uri, upMovie.uri)
-          const verdict = parseVerdict(vResp)
+          const clipSec = Math.max(cand.shortEnd - cand.shortStart, cand.movieEnd - cand.movieStart, 5)
+          let releaseVLock: ((sec?: number) => void) | null = null
+          try {
+            const apiKeys = scan.apiKeys && scan.apiKeys.length > 0 ? scan.apiKeys : [primaryApiKey]
+            const candLanes = apiKeys.flatMap((k, ki) =>
+              VERIFY_MODEL_POOL.map((m) => ({
+                apiKey: k,
+                keyIdx: ki + 1,
+                modelId: m.id,
+                rpd: m.rpd,
+              })),
+            )
 
-          cand.verifierModel = vModel
-          cand.verifierReason = verdict?.reason || ''
-          cand.verified = verdict?.same === true
+            const { selected, release } = await globalGeminiCoordinator.acquireFirstAvailableLane({
+              scanId,
+              scanTitle: scan.shortName || scanId,
+              candidates: candLanes,
+              operation: `Missing Scene Verify Short ${fmtTime(cand.shortStart)}`,
+              videoSeconds: clipSec,
+              onWait: (msg) => addLog(scan, 'info', msg),
+              isStopping: () => ctrl.stopping,
+            })
+            releaseVLock = release
 
-          if (verdict?.same) {
-            cand.status = 'confirmed'
-            const confirmedMatch: ChunkMatch = {
-              chunkIndex: cand.chunkIndex,
-              shortStart: cand.shortStart,
-              shortEnd: cand.shortEnd,
-              movieStart: cand.movieStart,
-              movieEnd: cand.movieEnd,
-              confidence: 0.98,
-              reason: `Targeted missing scene verified at 24 fps (${cand.verifierReason})`,
-              model: cand.model,
-              verified: true,
-              verifierModel: vModel,
-              verifierReason: cand.verifierReason,
-              origin: 'gap-backup',
+            const runnerAi = selected.apiKey === primaryApiKey ? ai : new GoogleGenAI({ apiKey: selected.apiKey })
+            const vResp = await verifyRequest(runnerAi, selected.modelId, upShort.uri, upMovie.uri)
+            const verdict = parseVerdict(vResp)
+
+            cand.verifierModel = selected.modelId
+            cand.verifierReason = verdict?.reason || ''
+            cand.verified = verdict?.same === true
+
+            if (verdict?.same) {
+              cand.status = 'confirmed'
+              const confirmedMatch: ChunkMatch = {
+                chunkIndex: cand.chunkIndex,
+                shortStart: cand.shortStart,
+                shortEnd: cand.shortEnd,
+                movieStart: cand.movieStart,
+                movieEnd: cand.movieEnd,
+                confidence: 0.98,
+                reason: `Targeted missing scene verified at 24 fps (${cand.verifierReason})`,
+                model: cand.model,
+                verified: true,
+                verifierModel: selected.modelId,
+                verifierReason: cand.verifierReason,
+                origin: 'gap-backup',
+              }
+
+              // Merge into scan.matches
+              if (!Array.isArray(scan.matches)) scan.matches = []
+              scan.matches = [...scan.matches.filter((m) => !(m.shortStart >= cand.shortStart && m.shortEnd <= cand.shortEnd)), confirmedMatch]
+              scan.matches.sort((a, b) => a.shortStart - b.shortStart)
+
+              state.addedMatches = state.addedMatches || []
+              state.addedMatches.push(confirmedMatch)
+
+              saveScan(scan)
+              addLog(
+                scan,
+                'success',
+                `[Missing Scene Finder] 24 FPS VERIFIED SAME! Short ${fmtTime(cand.shortStart)}–${fmtTime(cand.shortEnd)} matches Movie ${fmtTime(cand.movieStart)}–${fmtTime(cand.movieEnd)}!`,
+              )
+            } else {
+              cand.status = 'rejected'
+              saveScan(scan)
+              addLog(
+                scan,
+                'info',
+                `[Missing Scene Finder] 24 FPS Verifier: DIFFERENT for candidate ${fmtTime(cand.shortStart)}–${fmtTime(cand.shortEnd)} (${cand.verifierReason})`,
+              )
             }
-
-            // Merge into scan.matches
-            if (!Array.isArray(scan.matches)) scan.matches = []
-            scan.matches = [...scan.matches.filter((m) => !(m.shortStart >= cand.shortStart && m.shortEnd <= cand.shortEnd)), confirmedMatch]
-            scan.matches.sort((a, b) => a.shortStart - b.shortStart)
-
-            state.addedMatches = state.addedMatches || []
-            state.addedMatches.push(confirmedMatch)
-
-            saveScan(scan)
-            addLog(
-              scan,
-              'success',
-              `[Missing Scene Finder] 24 FPS VERIFIED SAME! Short ${fmtTime(cand.shortStart)}–${fmtTime(cand.shortEnd)} matches Movie ${fmtTime(cand.movieStart)}–${fmtTime(cand.movieEnd)}!`,
-            )
-          } else {
-            cand.status = 'rejected'
-            saveScan(scan)
-            addLog(
-              scan,
-              'info',
-              `[Missing Scene Finder] 24 FPS Verifier: DIFFERENT for candidate ${fmtTime(cand.shortStart)}–${fmtTime(cand.shortEnd)} (${cand.verifierReason})`,
-            )
+          } finally {
+            if (releaseVLock) releaseVLock(clipSec)
           }
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err)

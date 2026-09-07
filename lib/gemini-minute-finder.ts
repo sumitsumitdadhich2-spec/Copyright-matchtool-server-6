@@ -26,6 +26,7 @@ import {
 import { applyApprovedMinutes } from './minute-ranges'
 import { mergeRanges, missingRanges as sharedMissingRanges } from './short-coverage'
 import { scheduler } from './scheduler'
+import { globalGeminiCoordinator } from './global-gemini-coordinator'
 import { deductTokens, refundTokens, SCAN_TOKEN_COST } from './tokens'
 import type {
   Scan,
@@ -761,6 +762,16 @@ async function laneWorker(id: string, ctrl: Ctrl, lane: Lane, env: LaneEnv, pass
       continue
     }
 
+    // Global Coordinator Availability check:
+    // If this specific lane is currently busy in another scan or in pacing delay,
+    // sleep 1 second and DO NOT pop from queue yet.
+    // This allows any other idle/free lane (e.g. Key 3 · 3.8, Key 2 · 3.6) to pop the window immediately!
+    const laneBusy = globalGeminiCoordinator.isLaneBusy(lane.apiKey, lane.model.id, 0)
+    if (laneBusy.busy) {
+      await sleep(1000)
+      continue
+    }
+
     const idx = queue.shift()
     if (idx === undefined) {
       if (inFlight.size === 0) return
@@ -776,7 +787,21 @@ async function laneWorker(id: string, ctrl: Ctrl, lane: Lane, env: LaneEnv, pass
     w.error = undefined
     persist(id, ctrl)
 
+    let releaseGlobalLock: ((sec?: number) => void) | null = null
     try {
+      releaseGlobalLock = await globalGeminiCoordinator.acquireLane({
+        scanId: id,
+        scanTitle: ctrl.scan.shortName || id,
+        apiKey: lane.apiKey,
+        keyIdx: lane.keyIdx,
+        modelId: lane.model.id,
+        slot: 0,
+        operation: `${tag} #${w.index} (${fmtDur(w.startOffset)}–${fmtDur(w.endOffset)})`,
+        videoSeconds: 60,
+        onWait: (msg) => log(id, 'info', msg),
+        isStopping: () => ctrl.stopping,
+      })
+
       // Pacing: 1 request per minute per lane (TPM 250K). Uploads are already
       // done, so the wait is pure spacing.
       const wait = (ctrl.nextFreeAt[rk] || 0) - Date.now()
@@ -849,6 +874,7 @@ async function laneWorker(id: string, ctrl: Ctrl, lane: Lane, env: LaneEnv, pass
         queue.push(idx)
         log(id, 'error', `Key ${lane.keyIdx} is invalid or expired — all lanes for key ${lane.keyIdx} permanently disabled; ${tag.toLowerCase()} #${w.index} re-queued`)
       } else if (e.kind === 'rpd' || e.kind === 'unavailable') {
+        globalGeminiCoordinator.reportExhausted(lane.apiKey, lane.model.id, 0)
         setModelExhausted(lane.model.id, lane.apiKey, lane.model.rpd)
         lane.dead = true
         w.status = 'pending'
@@ -856,6 +882,7 @@ async function laneWorker(id: string, ctrl: Ctrl, lane: Lane, env: LaneEnv, pass
         log(id, 'warn', `Key ${lane.keyIdx} · ${lane.model.id}: model daily quota exhausted (${lane.model.rpd}/${lane.model.rpd} RPD) — model lane removed, key ${lane.keyIdx}'s other models remain active; ${tag.toLowerCase()} #${w.index} re-queued`)
       } else if (e.kind === 'rate') {
         // 429 RPM/TPM: cooldown, then send the SAME request again (unlimited).
+        globalGeminiCoordinator.reportRateLimit(lane.apiKey, lane.model.id, RATE_COOLDOWN_MS, 0)
         ctrl.cooldownUntil[rk] = Date.now() + RATE_COOLDOWN_MS
         w.status = 'pending'
         queue.push(idx)
@@ -884,6 +911,7 @@ async function laneWorker(id: string, ctrl: Ctrl, lane: Lane, env: LaneEnv, pass
       }
       persist(id, ctrl)
     } finally {
+      if (releaseGlobalLock) releaseGlobalLock(60)
       inFlight.delete(idx)
     }
   }

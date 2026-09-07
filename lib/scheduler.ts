@@ -57,6 +57,7 @@ import {
 } from './gemini'
 import { applyGroupMatches, bestRejectedCandidate, groupMatchOrigin, originTag, sameShortSegment } from './candidate-pick'
 import { computeShortCoverage, coverageLine } from './short-coverage'
+import { globalGeminiCoordinator } from './global-gemini-coordinator'
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
 
@@ -1616,20 +1617,51 @@ class Scheduler {
     if (getModelUsage(m.id, lane.apiKey) >= m.rpd) throw new GeminiError('rpd', `${m.id} daily cap reached`)
     const pk = this.paceSlotKey(lane, m, slot)
     const st = this.modelState(job, lane, m)
-    const wait = (job.nextFreeAt[pk] || 0) - Date.now()
-    if (wait > 0) {
-      st.state = 'waiting'
+
+    let releaseGlobalLock: ((sec?: number) => void) | null = null
+    try {
+      releaseGlobalLock = await globalGeminiCoordinator.acquireLane({
+        scanId: job.scan.id,
+        scanTitle: job.scan.shortName || job.scan.id,
+        apiKey: lane.apiKey,
+        keyIdx: lane.idx,
+        modelId: m.id,
+        slot,
+        operation: `Verify/Rescan on ${m.id}`,
+        videoSeconds,
+        onWait: (msg) => {
+          st.state = 'waiting'
+          addLog(job.scan, 'info', msg)
+          this.mark(job)
+        },
+        isStopping: () => job.stopping,
+      })
+
+      const wait = (job.nextFreeAt[pk] || 0) - Date.now()
+      if (wait > 0) {
+        st.state = 'waiting'
+        this.mark(job)
+        await this.stoppableSleep(job, wait)
+      }
+      // STOP CHECK: quota consume karne se PEHLE nikal jao — 'rate' kind se group
+      // bina attempt-penalty ke re-queue hota hai aur worker loop stopping par exit karta hai.
+      if (job.stopping) throw new GeminiError('rate', 'Stop requested — request cancelled before send')
+      st.state = 'active'
+      job.nextFreeAt[pk] = Date.now() + pacingIntervalMs(videoSeconds)
+      st.usedToday = incrementModelUsage(m.id, lane.apiKey)
       this.mark(job)
-      await this.stoppableSleep(job, wait)
+      return await fn()
+    } catch (err) {
+      const e = err instanceof GeminiError ? err : classifyError(err)
+      if (e.kind === 'rate') {
+        globalGeminiCoordinator.reportRateLimit(lane.apiKey, m.id, RATE_COOLDOWN_MS, slot)
+      } else if (e.kind === 'rpd' || e.kind === 'unavailable') {
+        globalGeminiCoordinator.reportExhausted(lane.apiKey, m.id, slot)
+      }
+      throw err
+    } finally {
+      if (releaseGlobalLock) releaseGlobalLock(videoSeconds)
     }
-    // STOP CHECK: quota consume karne se PEHLE nikal jao — 'rate' kind se group
-    // bina attempt-penalty ke re-queue hota hai aur worker loop stopping par exit karta hai.
-    if (job.stopping) throw new GeminiError('rate', 'Stop requested — request cancelled before send')
-    st.state = 'active'
-    job.nextFreeAt[pk] = Date.now() + pacingIntervalMs(videoSeconds)
-    st.usedToday = incrementModelUsage(m.id, lane.apiKey)
-    this.mark(job)
-    return fn()
   }
 
   /** BACKUP-UPLOAD + BUSY-RETRY (verify/rescan — "sab jagah" insurance):
@@ -2132,6 +2164,19 @@ class Scheduler {
       }
       st.cooldownUntil = null
 
+      // Global Coordinator Availability check:
+      // If this specific key/model lane is currently busy (working in another scan or in pacing delay),
+      // sleep 1 second and DO NOT pull chunk yet.
+      // This allows any other worker on an idle/free key (e.g. Key 3 · gemini-3.8, Key 2 · gemini-3.6)
+      // to pull from job.queue immediately without any wait!
+      const laneBusy = globalGeminiCoordinator.isLaneBusy(lane.apiKey, m.id, 0)
+      if (laneBusy.busy) {
+        st.state = laneBusy.cooling ? 'cooling' : 'waiting'
+        st.currentChunk = null
+        await sleep(1000)
+        continue
+      }
+
       // Pull next chunk (lane affinity: this key's pre-uploaded chunk first).
       // When the queue is empty but other workers are still in flight, wait —
       // a failed chunk may be re-queued for retry.
@@ -2168,7 +2213,25 @@ class Scheduler {
       const backupNames: string[] = []
       /** pending unused backup upload (deleted in finally if still set) */
       let pendingBackup: Promise<{ uri: string; name: string }> | null = null
+      let releaseGlobalLock: ((sec?: number) => void) | null = null
       try {
+        releaseGlobalLock = await globalGeminiCoordinator.acquireLane({
+          scanId: scan.id,
+          scanTitle: scan.shortName || scan.id,
+          apiKey: lane.apiKey,
+          keyIdx: lane.idx,
+          modelId: m.id,
+          slot: 0,
+          operation: `Chunk ${chunkIndex} map`,
+          videoSeconds: 60,
+          onWait: (msg) => {
+            st.state = 'waiting'
+            addLog(scan, 'info', msg)
+            this.mark(job)
+          },
+          isStopping: () => job.stopping,
+        })
+
         // PARALLEL UPLOADS: the short-minute segment + THIS movie chunk upload
         // AT THE SAME TIME (Promise.all) — and the per-model pacing wait
         // (TPM ≈ 1 request/min per model per key) overlaps with those uploads
@@ -2322,6 +2385,7 @@ class Scheduler {
           job.queue.push(chunkIndex)
           addLog(scan, 'error', `API Key ${lane.idx} is invalid/expired — permanently disabled; Chunk ${chunkIndex} re-queued for another key`)
         } else if (e.kind === 'rpd' || e.kind === 'unavailable') {
+          globalGeminiCoordinator.reportExhausted(lane.apiKey, m.id, 0)
           setModelExhausted(m.id, lane.apiKey, m.rpd)
           const laneState = job.scan.keyLanes.find((l) => l.idx === lane.idx)
           if (laneState) {
@@ -2332,6 +2396,7 @@ class Scheduler {
           job.queue.push(chunkIndex)
           addLog(scan, 'warn', `${m.id} (key ${lane.idx}) model daily quota exhausted (${m.rpd}/${m.rpd} RPD) — Chunk ${chunkIndex} re-queued for another worker (key ${lane.idx}'s other models remain active)`)
         } else if (e.kind === 'rate') {
+          globalGeminiCoordinator.reportRateLimit(lane.apiKey, m.id, RATE_COOLDOWN_MS, 0)
           job.cooldownUntil[this.rateKey(lane, m)] = Date.now() + RATE_COOLDOWN_MS
           chunk.status = 'pending'
           job.queue.push(chunkIndex)
@@ -2349,6 +2414,7 @@ class Scheduler {
         }
           this.mark(job)
       } finally {
+        if (releaseGlobalLock) releaseGlobalLock(60)
         // The short video is reused across chunks; the chunk upload is one-shot.
         if (chunkFileName) void deleteFileQuiet(lane.ai, chunkFileName)
         // Backup uploads: used copies + any still-pending unused copy — sab delete.
