@@ -233,13 +233,13 @@ Poore answer me sirf HISSA 1 aur HISSA 2 do, aur kuch nahi.`
 // ---------- Gemini Minute Finder (20-minute window pre-scan) ----------
 
 /** Model ids allowed for the minute finder — exactly the three chunk-map models. */
-export const MINUTE_FINDER_SHORT_FPS = 5
+export const MINUTE_FINDER_SHORT_FPS = 10
 
 /** Window version of the chunk-map prompt. `{{WINDOW_START}}` / `{{WINDOW_END}}`
  * are replaced per window (movie-copy clock, mm:ss). Goal: RECALL — which MINUTES
  * of the movie hold the short's footage; the 24 fps chunk scan verifies later. */
 export const MINUTE_FINDER_PROMPT = `You are a forensic video analyst. You are given TWO videos:
-- Video 1: a SHORT VIDEO that was edited together from clips of a movie (sampled at 5 fps).
+- Video 1: a SHORT VIDEO that was edited together from clips of a movie (sampled at 10 fps).
 - Video 2: a 20-MINUTE WINDOW of the original movie, covering movie time {{WINDOW_START}} to {{WINDOW_END}} (sampled at 1 fps).
 
 Tumhara kaam frame-perfect mapping NAHI hai. Tumhara kaam ye batana hai ki Video 1 ke kaun se scenes Video 2 ke andar hain, aur movie ke KAUN SE MINUTE(S) par hain — taaki agla step un minutes ko 24 fps par frame-by-frame check kar sake.
@@ -317,7 +317,7 @@ export function buildMinuteFinderPrompt(startOffsetSec: number, endOffsetSec: nu
   )
 }
 
-/** One minute-finder request: whole short @ 5 fps + one 20-minute movie window
+/** One minute-finder request: whole short @ 10 fps + one 20-minute movie window
  * (default 1 fps, selected with startOffset/endOffset on the SAME uploaded movie
  * copy). Same GEN_CONFIG as the chunk scan (thinking HIGH, max output tokens). */
 export async function runMinuteFinderWindow(

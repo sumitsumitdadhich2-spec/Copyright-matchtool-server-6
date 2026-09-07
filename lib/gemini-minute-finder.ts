@@ -4,7 +4,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import type { GoogleGenAI } from '@google/genai'
 import { getScan, saveScan, addLog, scanMediaDir, apiKeyHash, getModelUsage, incrementModelUsage, setModelExhausted, checkDailyReset, geminiUsageDay } from './store'
-import { ensureLocalMedia, localMediaPath } from './media'
+import { ensureLocalMedia, localMediaPath, findAndReusePrescanMovie, findReusableGeminiMovieUpload } from './media'
 import { preparePrescanMovieCopy, buildBackupClip } from './ffmpeg'
 import { CHUNK_MODEL_POOL, MODEL_MIN_INTERVAL_MS, RATE_COOLDOWN_MS, type ModelSpec } from './models'
 import {
@@ -190,6 +190,7 @@ export function startGeminiMinuteFinder(
   userApiKeys: string[],
   user: FinderUser,
   mode: 'start' | 'retry' | 'rerun' = 'start',
+  windowIndices?: number[],
 ): { ok: boolean; error?: string } {
   const scan = getScan(scanId)
   if (!scan) return { ok: false, error: 'Scan not found' }
@@ -232,12 +233,12 @@ export function startGeminiMinuteFinder(
     state.minuteSuggestions = undefined
     state.backup = undefined
     // Proactive storage sweep on start: clean any orphaned files older than 2 hours
-    void cleanupOrphanedGeminiFiles(apiKey, 2 * 60 * 60_000)
+    void cleanupOrphanedGeminiFiles(userApiKeys[0], 2 * 60 * 60_000)
 
     for (const k of Object.keys(state.uploads)) {
       const u = state.uploads[k]
       if (u.movieName) {
-        void deleteFileQuiet(getClient(apiKey), u.movieName)
+        void deleteFileQuiet(getClient(userApiKeys[0]), u.movieName)
       }
       state.uploads[k] = { ...u, movieUri: '', movieName: '' }
     }
@@ -248,10 +249,18 @@ export function startGeminiMinuteFinder(
     state.backup = undefined
   }
   if (mode === 'retry') {
-    for (const w of state.windows) {
-      if (w.status === 'failed' || w.status === 'running') {
+    const targetIndices = windowIndices && windowIndices.length > 0 ? new Set(windowIndices) : null
+    for (let idx = 0; idx < state.windows.length; idx++) {
+      const w = state.windows[idx]
+      const shouldRetry = targetIndices
+        ? targetIndices.has(idx) || targetIndices.has(w.index)
+        : w.status === 'failed' || w.status === 'running' || (w.status === 'done' && (w.matches || 0) === 0)
+      if (shouldRetry) {
         w.status = 'pending'
         w.error = undefined
+        w.matches = undefined
+        w.minutes = undefined
+        w.hissa3 = undefined
       }
     }
     if (state.backup) {
@@ -282,7 +291,7 @@ export function startGeminiMinuteFinder(
   log(
     scanId,
     'info',
-    `Gemini Minute Finder ${mode === 'start' ? 'start' : mode}: movie copy → upload (per key) → 20-min windows @ 5fps/1fps (${CHUNK_MODEL_POOL.map((m) => m.id).join(' + ')} × ${userApiKeys.length} key(s)) → backup pass for missing parts (high fps) → minute list → chunk scan`,
+    `Gemini Minute Finder ${mode === 'start' ? 'start' : mode}: movie copy → upload (per key) → 20-min windows @ 10fps/1fps (${CHUNK_MODEL_POOL.map((m) => m.id).join(' + ')} × ${userApiKeys.length} key(s)) → backup pass for missing parts (high fps) → minute list → chunk scan`,
   )
 
   void run(scanId, ctrl, userApiKeys, user)
@@ -367,14 +376,44 @@ async function run(id: string, ctrl: Ctrl, apiKeys: string[], user: FinderUser):
   // ---- [1] Movie upload copy (cached while the trim is unchanged) ----
   const copyPath = path.join(mediaDir, 'prescan-movie.mp4')
   const cachedCopy = ctrl.state.movieCopy
-  const copyValid =
+  let copyValid =
     cachedCopy &&
     fs.existsSync(copyPath) &&
     fs.statSync(copyPath).size === cachedCopy.sizeBytes &&
     Math.abs(cachedCopy.trimStart - trimStart) < 0.01 &&
     Math.abs(cachedCopy.trimEnd - trimEnd) < 0.01
+
+  if (!copyValid) {
+    // Check if another scan of the same movie with matching trim already has a valid copy
+    const sObj = getScan(id)
+    const reusedCopy = await findAndReusePrescanMovie(
+      id,
+      sObj?.movieName || '',
+      sObj?.movieSize || 0,
+      trimStart,
+      trimEnd,
+    )
+    if (reusedCopy) {
+      ctrl.state.movieCopy = {
+        path: copyPath,
+        durationSec: reusedCopy.durationSec,
+        sizeBytes: reusedCopy.sizeBytes,
+        reencoded: reusedCopy.reencoded,
+        trimStart,
+        trimEnd,
+      }
+      persist(id, ctrl)
+      log(
+        id,
+        'success',
+        `Re-encoded 480p movie copy pehle se bani hui hai (scan ${reusedCopy.sourceId}) — turant reuse ho gayi (${fmtDur(reusedCopy.durationSec)}, ${fmtMB(reusedCopy.sizeBytes)}), skipping re-encode`,
+      )
+      copyValid = true
+    }
+  }
+
   if (copyValid) {
-    log(id, 'info', `Movie copy cached (${fmtDur(cachedCopy.durationSec)}, ${fmtMB(cachedCopy.sizeBytes)}) — skip`)
+    log(id, 'info', `Movie copy cached (${fmtDur(ctrl.state.movieCopy!.durationSec)}, ${fmtMB(ctrl.state.movieCopy!.sizeBytes)}) — skip`)
   } else {
     // Any stale copy (different trim) also invalidates the per-key MOVIE uploads.
     for (const k of Object.keys(ctrl.state.uploads)) ctrl.state.uploads[k] = { ...ctrl.state.uploads[k], movieUri: '', movieName: '' }
@@ -575,13 +614,52 @@ async function ensureUploads(
   if (fresh) {
     ;[shortOk, movieOk] = await Promise.all([fileActive(ai, cached.shortName), fileActive(ai, cached.movieName)])
   }
+
+  // If movie upload is not active in current scan, check if any earlier scan of the same movie uploaded it for this key
+  let reusedMovie: { uri: string; name: string; uploadedAt?: number } | null = null
+  if (!movieOk) {
+    const sObj = getScan(id)
+    const candUpload = sObj
+      ? findReusableGeminiMovieUpload(
+          sObj.movieName || '',
+          sObj.movieSize || 0,
+          keyId,
+          ctrl.state.movieCopy?.trimStart ?? 0,
+          ctrl.state.movieCopy?.trimEnd ?? sObj.movieDuration ?? 0,
+          id,
+        )
+      : null
+    if (candUpload) {
+      const active = await fileActive(ai, candUpload.movieName)
+      if (active) {
+        movieOk = true
+        reusedMovie = { uri: candUpload.movieUri, name: candUpload.movieName, uploadedAt: candUpload.uploadedAt }
+        log(id, 'info', `Key ${keyIdx}: movie copy upload Gemini Files API par already ACTIVE hai (scan ${candUpload.sourceId}) — upload skip!`)
+      }
+    }
+  }
+
   if (shortOk && movieOk) {
+    if (reusedMovie && (!cached?.movieUri || cached.movieUri !== reusedMovie.uri)) {
+      ctrl.state.uploads[keyId] = {
+        shortUri: cached!.shortUri,
+        shortName: cached!.shortName,
+        movieUri: reusedMovie.uri,
+        movieName: reusedMovie.name,
+        uploadedAt: reusedMovie.uploadedAt || Date.now(),
+      }
+      persist(id, ctrl)
+    }
     log(id, 'info', `Key ${keyIdx}: uploads cached (short + movie copy) — skip`)
-    return cached!
+    return ctrl.state.uploads[keyId]
   }
   const [s, m] = await Promise.all([
     shortOk ? Promise.resolve({ uri: cached!.shortUri, name: cached!.shortName }) : uploadVideo(ai, shortFile),
-    movieOk ? Promise.resolve({ uri: cached!.movieUri, name: cached!.movieName }) : uploadVideo(ai, copyPath),
+    movieOk && reusedMovie
+      ? Promise.resolve({ uri: reusedMovie.uri, name: reusedMovie.name })
+      : movieOk
+        ? Promise.resolve({ uri: cached!.movieUri, name: cached!.movieName })
+        : uploadVideo(ai, copyPath),
   ])
   const up: GeminiPrescanUpload = {
     shortUri: s.uri,
@@ -727,7 +805,7 @@ async function laneWorker(id: string, ctrl: Ctrl, lane: Lane, env: LaneEnv, pass
       log(
         id,
         'info',
-        `${tag} #${w.index} (${fmtDur(w.startOffset)}–${fmtDur(w.endOffset)}): ${pass === 'backup' ? `missing-parts clip @${clipFps}fps` : 'short @5fps'} + window @1fps on ${lane.label}`,
+        `${tag} #${w.index} (${fmtDur(w.startOffset)}–${fmtDur(w.endOffset)}): ${pass === 'backup' ? `missing-parts clip @${clipFps}fps` : 'short @10fps'} + window @1fps on ${lane.label}`,
       )
 
       const { text, tokens, parsed } = await sendWindow(ctrl, lane, w, pass)

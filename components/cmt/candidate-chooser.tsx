@@ -41,14 +41,11 @@ export function CandidateChooser({
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
 
-  const scanRunning = scan.status === 'scanning' || scan.status === 'verifying'
   const renderRunning = scan.renderJob?.status === 'rendering'
-  const choiceLocked = scanRunning || renderRunning
-  const choiceLockedReason = scanRunning
-    ? 'Scan chal raha hai — pehle Stop karo'
-    : renderRunning
-      ? 'Render chal raha hai — finish ya cancel hone ke baad main clip badlo'
-      : null
+  const choiceLocked = renderRunning
+  const choiceLockedReason = renderRunning
+    ? 'Render chal raha hai — finish ya cancel hone ke baad main clip badlo'
+    : null
   const total = options.length
   // Index of the main clip in options (if present).
   const mainIdx = options.findIndex((o) => o.isMain)

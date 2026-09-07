@@ -68,8 +68,6 @@ export function bestRejectedCandidate(g: CandidateGroup): { c: CandidateEntry; i
 export function applyGroupMatches(scan: Scan, g: CandidateGroup): void {
   const pick = g.userPick
   const picked = pick ? g.candidates[pick.index] : undefined
-  const undecided = g.status === 'pending' || g.status === 'verifying' || g.status === 'rescanning'
-  if (!picked && undecided) return
 
   scan.matches = (scan.matches || []).filter((m) => !sameShortSegment(g.shortStart, g.shortEnd, m.shortStart, m.shortEnd))
 
@@ -119,9 +117,10 @@ export function applyGroupMatches(scan: Scan, g: CandidateGroup): void {
         originWindow: g.originWindow,
       })
     }
-  } else if (g.status === 'unverified') {
-    // Only push the single best candidate into scan.matches so unverified matches
-    // don't create duplicate stacked scenes in the stitched preview or export!
+  } else {
+    // Unverified or undecided (pending/verifying/rescanning): keep ONLY the single
+    // best candidate (index 0) in scan.matches so multiple chunk candidates
+    // NEVER duplicate, slice, or clutter the stitched preview, compare panel, or timeline!
     const best = g.candidates[0]
     if (best) {
       scan.matches.push({
@@ -193,16 +192,22 @@ function nearlySame(a: number, b: number) {
  *  rejected and not-yet-checked — the choice belongs to the user. */
 export function candidateOptionsFor(scan: Pick<Scan, 'matches' | 'candidateGroups'>, shortStart: number, shortEnd: number): CandidateOption[] {
   const groups = (scan.candidateGroups || []).filter((g) => {
-    const overlap = Math.min(g.shortEnd, shortEnd) - Math.max(g.shortStart, shortStart)
-    return overlap > 0.05
+    return (
+      sameShortSegment(g.shortStart, g.shortEnd, shortStart, shortEnd) ||
+      Math.min(g.shortEnd, shortEnd) - Math.max(g.shortStart, shortStart) > 0.05
+    )
   })
-  const mains = (scan.matches || []).filter((m) => Math.min(m.shortEnd, shortEnd) - Math.max(m.shortStart, shortStart) > 0.05)
+  const mains = (scan.matches || []).filter(
+    (m) =>
+      sameShortSegment(m.shortStart, m.shortEnd, shortStart, shortEnd) ||
+      Math.min(m.shortEnd, shortEnd) - Math.max(m.shortStart, shortStart) > 0.05,
+  )
+  const main = mains[0]
   const out: CandidateOption[] = []
+
   for (const g of groups) {
     g.candidates.forEach((c, index) => {
       const push = (viaRescan: boolean, ms: number, me: number) => {
-        const mainMatch = mains.find((m) => nearlySame(m.movieStart, ms) && nearlySame(m.movieEnd, me))
-        const isMain = mainMatch !== undefined
         const isUserPick = !!g.userPick && g.userPick.index === index && g.userPick.viaRescan === viaRescan
         out.push({
           groupId: g.id,
@@ -215,11 +220,11 @@ export function candidateOptionsFor(scan: Pick<Scan, 'matches' | 'candidateGroup
           movieEnd: me,
           chunkIndex: c.chunkIndex,
           model: c.model,
-          state: isMain ? 'main' : windowState(c, g, index, viaRescan),
-          isMain,
+          state: windowState(c, g, index, viaRescan),
+          isMain: false,
           isUserPick,
-          rejectedKept: isMain && !isUserPick && (mainMatch?.rejected === true || g.status === 'rejected'),
-          origin: mainMatch?.origin ?? groupMatchOrigin(g, viaRescan),
+          rejectedKept: false,
+          origin: groupMatchOrigin(g, viaRescan),
           originWindow: g.originWindow,
         })
       }
@@ -239,39 +244,51 @@ export function candidateOptionsFor(scan: Pick<Scan, 'matches' | 'candidateGroup
     return true
   })
 
-  // Guarantee that the currently active main match is always present as an option
-  if (mains.length > 0) {
-    const main = mains[0]
-    const hasMain = deduped.some((o) => o.isMain)
-    if (!hasMain) {
-      const closeOpt = deduped.find((o) => Math.abs(o.movieStart - main.movieStart) < 1.0)
-      if (closeOpt) {
-        closeOpt.isMain = true
-        closeOpt.state = 'main'
-      } else {
-        deduped.unshift({
-          groupId: groups[0]?.id ?? 'main',
-          groupStatus: groups[0]?.status ?? 'confirmed',
-          index: -1,
-          viaRescan: false,
-          shortStart: main.shortStart,
-          shortEnd: main.shortEnd,
-          movieStart: main.movieStart,
-          movieEnd: main.movieEnd,
-          chunkIndex: main.chunkIndex,
-          model: main.model,
-          state: 'main',
-          isMain: true,
-          isUserPick: !!main.userPick,
-          rejectedKept: isRejectedKept(main),
-          origin: main.origin ?? 'chunk',
-          originWindow: main.originWindow,
-        })
+  // Identify or inject the SINGLE active main option
+  let mainOpt: CandidateOption | undefined
+  if (main) {
+    mainOpt = deduped.find((o) => nearlySame(o.movieStart, main.movieStart) && nearlySame(o.movieEnd, main.movieEnd))
+    if (!mainOpt) {
+      mainOpt = deduped.find((o) => Math.abs(o.movieStart - main.movieStart) < 1.0)
+    }
+    if (!mainOpt) {
+      mainOpt = {
+        groupId: groups[0]?.id ?? 'main',
+        groupStatus: groups[0]?.status ?? 'confirmed',
+        index: -1,
+        viaRescan: false,
+        shortStart: main.shortStart,
+        shortEnd: main.shortEnd,
+        movieStart: main.movieStart,
+        movieEnd: main.movieEnd,
+        chunkIndex: main.chunkIndex,
+        model: main.model,
+        state: 'main',
+        isMain: true,
+        isUserPick: !!main.userPick,
+        rejectedKept: isRejectedKept(main),
+        origin: main.origin ?? 'chunk',
+        originWindow: main.originWindow,
       }
+      deduped.unshift(mainOpt)
+    }
+  } else if (deduped.length > 0) {
+    mainOpt = deduped[0]
+  }
+
+  // Strictly enforce: ONLY mainOpt is isMain=true, everything else is isMain=false
+  for (const o of deduped) {
+    if (o === mainOpt) {
+      o.isMain = true
+      o.state = 'main'
+      o.rejectedKept = isRejectedKept(main || o)
+      if (main?.origin) o.origin = main.origin
+    } else {
+      o.isMain = false
     }
   }
 
-  // Put the active main option first, then remaining candidates
+  // Put the active main option first (index 0), then remaining candidates
   return deduped.sort((a, b) => Number(b.isMain) - Number(a.isMain) || a.shortStart - b.shortStart || a.movieStart - b.movieStart)
 }
 

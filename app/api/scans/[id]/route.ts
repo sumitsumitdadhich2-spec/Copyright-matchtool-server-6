@@ -6,6 +6,7 @@ import { scheduler } from '@/lib/scheduler'
 import { ensureBackgroundWorkers, stopBackgroundScan } from '@/lib/background-queue'
 import { getSession } from '@/lib/users'
 import { isMinuteFinderRunning, stopGeminiMinuteFinder } from '@/lib/gemini-minute-finder'
+import { cancelRender } from '@/lib/render'
 
 export const runtime = 'nodejs'
 
@@ -46,12 +47,39 @@ export async function DELETE(_req: Request, ctx: { params: Promise<{ id: string 
     return NextResponse.json({ error: 'Not found' }, { status: 404 })
   }
 
-  // Stop queued/running scan work and the minute finder before removing files.
+  // Stop queued/running scan work, minute finder, and renders before removing files.
   await stopBackgroundScan(id)
   if (scheduler.isRunning(id)) scheduler.stop(id)
   if (isMinuteFinderRunning(id)) stopGeminiMinuteFinder(id)
+  cancelRender(id)
 
   deleteScan(id)
   invalidateUsageCache()
   return NextResponse.json({ ok: true, deleted: id })
 }
+
+/** Update scan properties (e.g. verifierEnabled toggle). */
+export async function PATCH(req: Request, ctx: { params: Promise<{ id: string }> }) {
+  const session = await getSession()
+  if (!session) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
+
+  const { id } = await ctx.params
+  const scan = getScan(id)
+  if (!scan) return NextResponse.json({ error: 'Not found' }, { status: 404 })
+  if (session.role !== 'admin' && scan.ownerUsername !== session.username) {
+    return NextResponse.json({ error: 'Not found' }, { status: 404 })
+  }
+
+  const body = (await req.json().catch(() => ({}))) as { verifierEnabled?: boolean }
+  if (body.verifierEnabled !== undefined) {
+    const enabled = Boolean(body.verifierEnabled)
+    scan.verifierEnabled = enabled
+    scheduler.setVerifierEnabled(id, enabled)
+    const { saveScan } = await import('@/lib/store')
+    saveScan(scan, { immediate: true })
+    return NextResponse.json({ ok: true, verifierEnabled: enabled })
+  }
+
+  return NextResponse.json({ ok: true })
+}
+

@@ -117,6 +117,25 @@ export async function setUserMinuteFinderMode(username: string, mode: MinuteFind
   await writeUserKeys(username, { ...keys, [MINUTE_FINDER_SLOT]: mode })
 }
 
+// ---------------------------------------------------------------------------
+// VERIFIER ENABLED — per-user preference stored under a reserved slot.
+// Default true (auto-verifier on).
+// ---------------------------------------------------------------------------
+
+const VERIFIER_ENABLED_SLOT = 'verifierEnabled'
+
+/** Whether candidate verifier runs for this user (default true). */
+export async function getUserVerifierEnabled(username: string): Promise<boolean> {
+  const keys = await readUserKeys(username)
+  const v = keys[VERIFIER_ENABLED_SLOT]
+  return v === 'false' ? false : true
+}
+
+export async function setUserVerifierEnabled(username: string, enabled: boolean): Promise<void> {
+  const keys = await readUserKeys(username)
+  await writeUserKeys(username, { ...keys, [VERIFIER_ENABLED_SLOT]: enabled ? 'true' : 'false' })
+}
+
 /** Delete a user's entire key file (used when the account is deleted). */
 export async function deleteUserKeys(username: string): Promise<void> {
   await deleteJSONRecord(recordFor(username))

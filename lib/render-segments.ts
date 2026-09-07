@@ -44,10 +44,20 @@ export function buildRenderSegments(scan: Pick<Scan, 'matches'>): RenderSegment[
     if (previous) {
       const overlap = previous.shortEnd - shortStart
       if (overlap > 0.05) {
-        // Fully covered already (duplicate candidate for the same short window) — skip.
-        if (shortEnd <= previous.shortEnd + 0.05) continue
-        // Partial overlap — trim the front (mapping is 1:1 same-duration) so the
-        // extra tail is kept instead of throwing the whole match away.
+        const prevDuration = previous.shortEnd - previous.shortStart
+        const currDuration = shortEnd - shortStart
+        const shorter = Math.min(prevDuration, currDuration)
+        const isSameSegment =
+          (shorter > 0 && overlap / shorter >= 0.35) ||
+          overlap >= 0.4 ||
+          shortEnd <= previous.shortEnd + 0.05
+
+        if (isSameSegment) {
+          // Alternative candidate or duplicate for the already placed short segment — skip it.
+          continue
+        }
+
+        // Genuine partial boundary overlap between adjacent distinct scenes:
         movieStart += previous.shortEnd - shortStart
         shortStart = previous.shortEnd
         if (shortEnd - shortStart <= 0.05 || movieEnd - movieStart <= 0.05) continue
@@ -68,7 +78,9 @@ export function buildRenderSegments(scan: Pick<Scan, 'matches'>): RenderSegment[
     // Prevent unverified matches from duplicating an already placed movie scene elsewhere in the timeline
     if (match.userPick !== true && match.verified !== true) {
       const isDuplicateMovieClip = segments.some(
-        (s) => Math.abs(s.movieStart - movieStart) < 0.5 && Math.abs(s.movieEnd - movieEnd) < 0.5,
+        (s) =>
+          Math.max(0, Math.min(s.movieEnd, movieEnd) - Math.max(s.movieStart, movieStart)) > 0.5 ||
+          (Math.abs(s.movieStart - movieStart) < 0.5 && Math.abs(s.movieEnd - movieEnd) < 0.5),
       )
       if (isDuplicateMovieClip) continue
     }

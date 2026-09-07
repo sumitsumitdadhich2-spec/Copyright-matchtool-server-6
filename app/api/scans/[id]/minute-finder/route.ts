@@ -44,7 +44,7 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
   if (!session) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
 
   const { id } = await ctx.params
-  const body = (await req.json().catch(() => ({}))) as { action?: string }
+  const body = (await req.json().catch(() => ({}))) as { action?: string; windowIndices?: number[] }
   const action = body.action === 'retry' ? 'retry' : body.action === 'rerun' ? 'rerun' : 'start'
 
   const scan = await getFreshScan(id)
@@ -55,7 +55,7 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
     return NextResponse.json({ error: 'Gemini API key nahi hai — Settings me apni key add karo.' }, { status: 400 })
   }
 
-  const result = startGeminiMinuteFinder(id, keys, { username: session.username, role: session.role }, action)
+  const result = startGeminiMinuteFinder(id, keys, { username: session.username, role: session.role }, action, body.windowIndices)
   if (!result.ok) return NextResponse.json({ error: result.error }, { status: 409 })
   return NextResponse.json({ ok: true, action })
 }

@@ -6,7 +6,7 @@ import { Loader2 } from 'lucide-react'
 import type { MinuteFinderMode } from '@/lib/types'
 
 const OPTIONS: { value: MinuteFinderMode; label: string; title: string }[] = [
-  { value: 'gemini', label: 'Gemini', title: 'Gemini Minute Finder — 20-min windows @ 5fps/1fps, phir auto chunk scan' },
+  { value: 'gemini', label: 'Gemini', title: 'Gemini Minute Finder — 20-min windows @ 10fps/1fps, phir auto chunk scan' },
   { value: 'twelvelabs', label: 'TwelveLabs', title: 'Purana flow — merge → Marengo → Pegasus → minute approval' },
   { value: 'off', label: 'Off', title: 'Koi minute finder nahi — manual Start = normal Full scan' },
 ]

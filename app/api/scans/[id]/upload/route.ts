@@ -1,8 +1,9 @@
 import { NextResponse } from 'next/server'
 import fs from 'node:fs'
+import path from 'node:path'
 import { Readable } from 'node:stream'
 import type { ReadableStream as WebReadableStream } from 'node:stream/web'
-import { addLog, getScan, saveScan, SCANS_DIR } from '@/lib/store'
+import { addLog, getScan, saveScan, scanMediaDir, SCANS_DIR } from '@/lib/store'
 import { restoreScans } from '@/lib/scan-store'
 import {
   finalizeUploadedMedia,
@@ -199,6 +200,22 @@ async function reuseFromScan(req: Request, id: string, kind: MediaKind, name: st
 
   const fresh = getScan(id)
   if (fresh) {
+    if (kind === 'movie') {
+      // Proactively link prescan-movie.mp4 if source scan already has it
+      const srcPrescan = path.join(scanMediaDir(sourceId), 'prescan-movie.mp4')
+      const dstPrescan = path.join(scanMediaDir(id), 'prescan-movie.mp4')
+      if (fs.existsSync(srcPrescan) && fs.statSync(srcPrescan).size > 1000 && !fs.existsSync(dstPrescan)) {
+        try {
+          fs.linkSync(srcPrescan, dstPrescan)
+        } catch {
+          try {
+            fs.copyFileSync(srcPrescan, dstPrescan)
+          } catch {
+            // ignore
+          }
+        }
+      }
+    }
     addLog(fresh, 'success', `${kind === 'short' ? 'Short' : 'Movie'} "${name}" pehle se server par tha (scan ${sourceId}) — bina upload ${((Date.now() - startedAt) / 1000).toFixed(1)}s me link ho gaya`)
     saveScan(fresh, { immediate: true })
   }

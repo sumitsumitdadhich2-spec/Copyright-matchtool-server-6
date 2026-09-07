@@ -26,11 +26,6 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
   if (!scan || (session.role !== 'admin' && scan.ownerUsername !== session.username)) {
     return NextResponse.json({ error: 'Not found' }, { status: 404 })
   }
-  // The running scheduler owns the in-memory scan and would overwrite a file
-  // edit on its next save — ask for Stop first.
-  if (scheduler.isRunning(id) || scan.status === 'scanning' || scan.status === 'verifying') {
-    return NextResponse.json({ error: 'Scan chal raha hai — candidate choose karne se pehle Stop karo' }, { status: 409 })
-  }
   if (isRenderActive(id) || scan.renderJob?.status === 'rendering') {
     return NextResponse.json({ error: 'Render chal raha hai — finish ya cancel hone ke baad main clip badlo' }, { status: 409 })
   }
@@ -39,6 +34,20 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
     groupId?: string
     candidateIndex?: number | null
     viaRescan?: boolean
+  }
+
+  if (scheduler.isRunning(id)) {
+    const res = scheduler.applyUserPick(
+      id,
+      body.groupId || '',
+      body.candidateIndex === null ? null : body.candidateIndex,
+      body.viaRescan === true,
+    )
+    if (!res.ok) {
+      return NextResponse.json({ error: res.error || 'Choice apply nahi ho saki' }, { status: 400 })
+    }
+    invalidateRenderedOutput(scan)
+    return NextResponse.json({ ok: true })
   }
   const g = (scan.candidateGroups || []).find((x) => x.id === body.groupId)
   if (!g) return NextResponse.json({ error: 'Candidate group not found' }, { status: 404 })

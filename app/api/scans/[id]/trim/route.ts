@@ -7,6 +7,7 @@ import { getSession } from '@/lib/users'
 import { pipelineReady } from '@/lib/merge-pipeline'
 import { dispatchMinuteFinder } from '@/lib/minute-finder-dispatch'
 import { isMinuteFinderRunning, stopAndWaitMinuteFinder } from '@/lib/gemini-minute-finder'
+import { findAndReuseMovieChunks } from '@/lib/media'
 
 export const runtime = 'nodejs'
 
@@ -82,6 +83,28 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
   // Chunk in the background; the client polls chunkingProgress.
   void (async () => {
     try {
+      // Check if this movie's chunks were already cut in an earlier scan
+      const reused = await findAndReuseMovieChunks(
+        id,
+        scan.movieName || '',
+        scan.movieSize || 0,
+        isFull ? 0 : start,
+        isFull ? dur : end,
+        count,
+      )
+      if (reused.ok) {
+        const s = getScan(id)
+        if (s) {
+          s.chunkCount = reused.count
+          s.chunks = Array.from({ length: reused.count }, (_, i) => ({ index: i, status: 'pending' as const, attempts: 0 }))
+          s.status = 'ready'
+          s.chunkingProgress = 100
+          addLog(s, 'success', `Movie chunks pehle se cut hain (scan ${reused.sourceId}) — ${reused.count} chunks turant reuse ho gaye (no re-cut)`)
+          saveScan(s)
+        }
+        return
+      }
+
       const actual = await chunkMovie(
         dest,
         path.join(mediaDir, 'chunks'),

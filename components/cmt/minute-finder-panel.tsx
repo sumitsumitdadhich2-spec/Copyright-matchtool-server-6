@@ -7,6 +7,7 @@ import type { Scan, GeminiPrescanState, GeminiPrescanStatus, GeminiPrescanWindow
 import { fetcher, fmtTime, fmtBytes } from '@/lib/format'
 import { displayModelName } from '@/lib/models'
 import { MinuteFinderToggle } from './minute-finder-toggle'
+import { MissingScenePanel } from './missing-scene-panel'
 
 interface FinderResponse {
   mode: MinuteFinderMode
@@ -344,7 +345,7 @@ export function MinuteFinderPanel({ scan, mode, onModeChanged }: { scan: Scan; m
           {windows.length > 0 && (
             <div className="mt-3">
               <h3 className="text-xs font-semibold text-muted-foreground">
-                Windows ({doneWindows}/{windows.length} done{failedWindows ? `, ${failedWindows} failed` : ''}) — short @5fps + window @1fps
+                Windows ({doneWindows}/{windows.length} done{failedWindows ? `, ${failedWindows} failed` : ''}) — short @10fps + window @1fps
               </h3>
               <ul className="mt-1.5 grid gap-1.5 sm:grid-cols-2 lg:grid-cols-3">
                 {windows.map((w) => (
@@ -368,10 +369,12 @@ export function MinuteFinderPanel({ scan, mode, onModeChanged }: { scan: Scan; m
 
           <p className="mt-2 text-xs leading-relaxed text-muted-foreground">
             Auto flow: trim confirm hote hi trimmed movie ki ek upload-copy banti hai (≤1.9 GB), short + copy har API key par Files API me upload hote hain,
-            phir movie 20-minute windows me {data?.models?.map(displayModelName).join(' + ') || 'gemini-3.6-flash + gemini-3.7-flash + gemini-3.8-flash'} par scan hoti hai (short 5 fps, window 1 fps).
+            phir movie 20-minute windows me {data?.models?.map(displayModelName).join(' + ') || 'gemini-3.6-flash + gemini-3.7-flash + gemini-3.8-flash'} par scan hoti hai (short 10 fps, window 1 fps).
             Short ke jo hisse (≥4 s) kisi window me nahi mile, unhe cut karke high-fps (5–24) backup clip banti hai aur har window me dobara dhundha jata hai — ek hi baar.
             Jo minutes milte hain unpar 24 fps chunk-time scan apne aap start ho jata hai — koi approval nahi.
           </p>
+
+          <MissingScenePanel scan={scan} />
         </>
       )}
     </section>

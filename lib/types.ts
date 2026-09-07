@@ -166,6 +166,59 @@ export type ScanStatus =
   | 'stopped'
   | 'error'
 
+// ---------- Missing Scene Window Finder ----------
+
+export interface MissingSceneTarget {
+  id: string
+  shortStart: number
+  shortEnd: number
+  duration: number
+  clipStart?: number
+  clipEnd?: number
+}
+
+export interface MissingSceneWindowHit {
+  windowIndex: number
+  windowStart: number
+  windowEnd: number
+  movieMinute: number
+  sceneId?: string
+  shortStart: number
+  shortEnd: number
+  evidence?: string
+  confidence?: 'HIGH' | 'MEDIUM' | 'LOW'
+}
+
+export interface MissingSceneCandidate {
+  id: string
+  sceneId: string
+  shortStart: number
+  shortEnd: number
+  movieMinute: number
+  chunkIndex: number
+  movieStart: number
+  movieEnd: number
+  model: string
+  confidence?: number
+  reason?: string
+  verified?: boolean
+  verifierModel?: string
+  verifierReason?: string
+  status: 'pending' | 'scanning_chunk' | 'verifying' | 'confirmed' | 'rejected'
+}
+
+export interface MissingSceneScanState {
+  status: 'idle' | 'preparing' | 'scanning_windows' | 'scanning_chunks' | 'verifying' | 'done' | 'stopped' | 'error'
+  progress?: string
+  selectedScenes: MissingSceneTarget[]
+  windowHits?: MissingSceneWindowHit[]
+  candidates: MissingSceneCandidate[]
+  addedMatches?: ChunkMatch[]
+  error?: string | null
+  startedAt?: number | null
+  finishedAt?: number | null
+}
+
 // ---------- Candidate + Verifier system ----------
 
 export type CandidateVerdict = 'pending' | 'verifying' | 'same' | 'different' | 'error'
@@ -324,7 +377,7 @@ export interface MergePipelineState {
 // ---------- Gemini Minute Finder (TwelveLabs/Pegasus alternative) ----------
 
 /** Which minute finder runs after upload + trim confirm.
- *  'gemini' (default) = Gemini Minute Finder (20-min windows @ 5fps/1fps),
+ *  'gemini' (default) = Gemini Minute Finder (20-min windows @ 10fps/1fps),
  *  'twelvelabs' = old merge → Marengo → Pegasus → approval flow (unchanged),
  *  'off' = no finder; user presses Start for a normal full scan. */
 export type MinuteFinderMode = 'gemini' | 'twelvelabs' | 'off'
@@ -647,6 +700,8 @@ export interface Scan {
   matches: ChunkMatch[]
   /** Candidate + verifier pipeline: one group per claimed short segment */
   candidateGroups?: CandidateGroup[]
+  /** Verifier system toggle: true (default, auto-verify candidates at 24fps) | false (verifier off, skip verification) */
+  verifierEnabled?: boolean
   /** OPTIONAL Twelve Labs pre-filter: movie indexing state (absent = feature unused) */
   twelveLabs?: TwelveLabsState
   /** pre-filter decision of the LAST scan run (for the UI) */
@@ -657,6 +712,8 @@ export interface Scan {
   geminiPrescan?: GeminiPrescanState
   /** GAP BACKUP PASS (post-verification): never-found short parts re-searched in every window */
   gapBackup?: GapBackupState
+  /** MISSING SCENE SCANNER: user-triggered targeted search for selected missing short scenes */
+  missingSceneScan?: MissingSceneScanState
   logs: LogEntry[]
   startedAt: number | null
   finishedAt: number | null

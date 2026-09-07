@@ -6,6 +6,7 @@ import { MODEL_POOL } from './models'
 import { backupScan, deleteScanRemote } from './scan-store'
 import { DATA_DIR, SCANS_DIR, MEDIA_DIR, MAX_SCANS } from './paths'
 import { removeScanWork } from './work-dir'
+import { getUserVerifierEnabled } from './user-keys'
 
 export { DATA_DIR, SCANS_DIR, MEDIA_DIR, MAX_SCANS }
 
@@ -246,6 +247,7 @@ export function newScan(ownerUsername?: string): Scan {
     error: null,
     report: null,
     modelStates: {},
+    verifierEnabled: ownerUsername ? getUserVerifierEnabled(ownerUsername) : true,
   }
   saveScan(scan)
   return scan

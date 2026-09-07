@@ -26,8 +26,9 @@ import {
   checkDailyReset,
   geminiUsageDay,
   scanMediaDir,
+  listScans,
 } from './store'
-import { chunkPath, cleanupChunks, cleanupClips, extractClipPrecise, extractSegment, segmentPath } from './ffmpeg'
+import { chunkPath, cleanupClips, extractClipPrecise, extractSegment, segmentPath } from './ffmpeg'
 import { chunkOverlapsSegRange, segMovieRange, segHasMinuteList, formatMinuteList } from './segment-range'
 import {
   ensureIndex,
@@ -420,6 +421,70 @@ class Scheduler {
     return { ok: true }
   }
 
+  /** Update verifier enabled on a running job (e.g. from the UI button). */
+  setVerifierEnabled(scanId: string, enabled: boolean) {
+    const job = this.jobs.get(scanId)
+    if (job) {
+      job.scan.verifierEnabled = enabled
+      if (!enabled) {
+        // If turned off while running, clear the verify queue and settle pending groups as unverified
+        job.verifyQueue = []
+        for (const g of job.scan.candidateGroups || []) {
+          if (g.status === 'pending' || g.status === 'verifying' || g.status === 'rescanning') {
+            g.status = 'unverified'
+            applyGroupMatches(job.scan, g)
+          }
+        }
+        this.mark(job)
+      }
+    }
+  }
+
+  /** Apply a user candidate pick to a running job in memory, keeping in-flight state in sync. */
+  applyUserPick(
+    scanId: string,
+    groupId: string,
+    candidateIndex: number | null,
+    viaRescan = false,
+  ): { ok: boolean; error?: string } {
+    const job = this.jobs.get(scanId)
+    if (!job) return { ok: false, error: 'Scan is not running' }
+    const g = (job.scan.candidateGroups || []).find((x) => x.id === groupId)
+    if (!g) return { ok: false, error: 'Candidate group not found' }
+
+    if (candidateIndex === null) {
+      delete g.userPick
+      applyGroupMatches(job.scan, g)
+      addLog(
+        job.scan,
+        'info',
+        `User choice cleared for short ${fmtTime(g.shortStart)}–${fmtTime(g.shortEnd)} — AI verdict (${g.status}) restored`,
+      )
+    } else {
+      const idx = Number(candidateIndex)
+      if (!Number.isInteger(idx) || idx < 0 || idx >= g.candidates.length) {
+        return { ok: false, error: 'Invalid candidate index' }
+      }
+      const c = g.candidates[idx]
+      if (viaRescan && (c.rescanMovieStart == null || c.rescanMovieEnd == null)) {
+        return { ok: false, error: 'This candidate has no rescan window' }
+      }
+      g.userPick = { index: idx, viaRescan, at: Date.now() }
+      applyGroupMatches(job.scan, g)
+      const pickedWin = viaRescan
+        ? `${fmtTime(c.rescanMovieStart!)}–${fmtTime(c.rescanMovieEnd!)} (rescan)`
+        : `${fmtTime(c.movieStart)}–${fmtTime(c.movieEnd)}`
+      addLog(
+        job.scan,
+        'success',
+        `User choice applied: short ${fmtTime(g.shortStart)}–${fmtTime(g.shortEnd)} → movie ${pickedWin} (Candidate ${idx + 1} of ${g.candidates.length})`,
+      )
+    }
+    this.mark(job)
+    saveScan(job.scan, { immediate: true })
+    return { ok: true }
+  }
+
   /** MANUAL chunk retry: reset one chunk and re-run its mapping (chunk models only).
    *  Works while a scan is running (re-queues on the live job) AND after it has
    *  finished (restarts the scheduler in resume mode; the chunk file is re-cut
@@ -612,6 +677,33 @@ class Scheduler {
         // TRIM-AWARE: chunk N starts at trimStart + N*60 in the ORIGINAL movie.
         const { start: cs, end: ce } = chunkAbsWindow(scan, chunkIndex)
         fs.mkdirSync(chunksDir, { recursive: true })
+
+        // Check if another scan of the same movie has this chunk already cut
+        const otherScans = listScans().filter((s) => s.id !== scan.id && s.movieName === scan.movieName)
+        for (const os of otherScans) {
+          const fullOs = getScan(os.id)
+          if (!fullOs || fullOs.movieSize !== scan.movieSize) continue
+          const osWin = chunkAbsWindow(fullOs, chunkIndex)
+          if (Math.abs(osWin.start - cs) < 0.1 && Math.abs(osWin.end - ce) < 0.1) {
+            const candFile = chunkPath(path.join(scanMediaDir(os.id), 'chunks'), chunkIndex)
+            if (fs.existsSync(candFile) && fs.statSync(candFile).size > 0) {
+              try {
+                fs.linkSync(candFile, chunkFile)
+              } catch {
+                try {
+                  fs.copyFileSync(candFile, chunkFile)
+                } catch {
+                  // ignore
+                }
+              }
+              if (fs.existsSync(chunkFile)) {
+                addLog(scan, 'info', `Chunk ${chunkIndex}: reused from scan ${os.id} (no re-cut)`)
+                return chunkFile
+              }
+            }
+          }
+        }
+
         addLog(scan, 'info', `Chunk ${chunkIndex}: chunk file missing — re-cutting ${cs}s–${ce}s from movie`)
         await extractClipPrecise(path.join(scanMediaDir(scan.id), 'movie.mp4'), cs, ce, chunkFile)
         return chunkFile
@@ -907,6 +999,10 @@ class Scheduler {
     // wait mat karo — wo background me chalti rahegi).
     let verifyPhase: Promise<unknown> = Promise.resolve()
     const startVerifyWorkers = () => {
+      if (scan.verifierEnabled === false) {
+        verifyPhase = Promise.resolve()
+        return
+      }
       const ws: Promise<void>[] = []
       for (const lane of job.lanes) {
         for (const m of VERIFY_MODEL_POOL) {
@@ -986,7 +1082,10 @@ class Scheduler {
         // Minute ke saare chunks settle — turant AGLE minute par badho.
         // Is minute ki bachi verification background me poori hoti rahegi.
         const segGroups = (scan.candidateGroups || []).filter((g) => g.shortStart < seg.end && g.shortEnd > seg.start)
-        const unresolved = segGroups.filter((g) => g.status === 'pending' || g.status === 'verifying' || g.status === 'rescanning')
+        const unresolved =
+          scan.verifierEnabled === false
+            ? []
+            : segGroups.filter((g) => g.status === 'pending' || g.status === 'verifying' || g.status === 'rescanning')
         seg.status = unresolved.length > 0 ? 'verifying' : 'done'
         if (multi) {
           addLog(
@@ -1006,7 +1105,11 @@ class Scheduler {
       job.chunkPhaseDone = true
       // STOP GUARD: stop ke baad status kabhi 'stopped' se wapas 'verifying'
       // nahi hota — warna export/preview panel phir chhup jaata.
-      if (!job.stopping && (job.verifyQueue.length > 0 || job.verifyInFlight.size > 0)) {
+      if (
+        !job.stopping &&
+        scan.verifierEnabled !== false &&
+        (job.verifyQueue.length > 0 || job.verifyInFlight.size > 0)
+      ) {
         scan.status = 'verifying'
         this.mark(job)
       }
@@ -1072,9 +1175,8 @@ class Scheduler {
     )
     // COVERAGE: kitna short actually merge me ja raha hai — MISSING hisse LOUD.
     this.logCoverage(job)
-    cleanupChunks(path.join(scanMediaDir(scan.id), 'chunks'))
     cleanupClips(path.join(scanMediaDir(scan.id), 'clips'))
-    addLog(scan, 'info', 'Temporary chunk files cleaned up')
+    addLog(scan, 'info', 'Temporary clip files cleaned up (movie chunks saved for future scan reuse)')
     this.finish(job)
   }
 
@@ -1127,6 +1229,10 @@ class Scheduler {
       }
     }
     scan.candidateGroups = groups
+    // Keep scan.matches cleanly synchronized: exactly one active match per candidate group
+    for (const g of groups) {
+      applyGroupMatches(scan, g)
+    }
   }
 
   /** Reset transient candidate-group states left over from an interrupted run. */
@@ -1265,6 +1371,16 @@ class Scheduler {
   private enqueueNewGroups(job: Job, logResume = false) {
     const { scan } = job
     this.buildCandidateGroups(scan)
+    if (scan.verifierEnabled === false) {
+      // Verifier OFF: settle all pending candidate groups as unverified immediately
+      for (const g of scan.candidateGroups || []) {
+        if (g.status === 'pending' || g.status === 'verifying' || g.status === 'rescanning') {
+          g.status = 'unverified'
+          this.applyGroupResult(job, g)
+        }
+      }
+      return
+    }
     const groups = scan.candidateGroups || []
     let added = 0
     for (let i = 0; i < groups.length; i++) {
@@ -1310,7 +1426,7 @@ class Scheduler {
   private async verifyWorker(job: Job, lane: KeyLane, m: ModelSpec, slot: number = 0) {
     const { scan } = job
     while (true) {
-      if (job.stopping) return
+      if (job.stopping || scan.verifierEnabled === false) return
       const st = this.modelState(job, lane, m)
 
       if (getModelUsage(m.id, lane.apiKey) >= m.rpd) {

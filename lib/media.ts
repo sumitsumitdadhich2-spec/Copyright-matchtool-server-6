@@ -2,7 +2,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { getScan, saveScan, addLog, scanMediaDir, listScans } from './store'
 import type { Scan } from './types'
-import { probeDuration, chunkShort, cleanupSegments } from './ffmpeg'
+import { probeDuration, chunkShort, cleanupSegments, chunkPath } from './ffmpeg'
 import { CHUNK_SECONDS } from './models'
 import { deleteEmbeddings } from './twelvelabs'
 import { copyObject, getFile, objectExists, putFile, storageEnabled } from './storage'
@@ -204,13 +204,200 @@ export async function mirrorReusedMedia(targetId: string, kind: MediaKind, sourc
   return mirrorMediaToStorage(targetId, kind, contentType)
 }
 
+// ---------- Re-use 480p prescan copy, chunks, and Gemini uploads across scans ----------
+
+/**
+ * Check if the 1-minute cut chunks for THIS exact movie and trim range already
+ * exist from a previous scan. If so, hard-link (or copy) all chunk files into targetId's
+ * chunks dir so heavy ffmpeg chunk cutting is completely skipped.
+ */
+export async function findAndReuseMovieChunks(
+  targetId: string,
+  movieName: string,
+  movieSize: number,
+  trimStart: number,
+  trimEnd: number,
+  expectedCount: number,
+): Promise<{ ok: boolean; count: number; sourceId?: string }> {
+  if (!movieName || !Number.isFinite(movieSize) || movieSize <= 0 || expectedCount <= 0) {
+    return { ok: false, count: 0 }
+  }
+
+  const targetChunksDir = path.join(scanMediaDir(targetId), 'chunks')
+  const candidates = listScans()
+    .filter((s) => s.id !== targetId && s.movieName === movieName)
+    .map((s) => getScan(s.id))
+    .filter((s): s is Scan => Boolean(s) && s.movieSize === movieSize)
+
+  for (const cand of candidates) {
+    const candStart = cand.movieTrimStart ?? 0
+    const candEnd = cand.movieTrimEnd ?? cand.movieDuration ?? 0
+    // Check if the trim range is identical (within 0.1s tolerance)
+    if (Math.abs(candStart - trimStart) >= 0.1 || Math.abs(candEnd - trimEnd) >= 0.1) continue
+
+    const candChunksDir = path.join(scanMediaDir(cand.id), 'chunks')
+    if (!fs.existsSync(candChunksDir)) continue
+
+    // Check if all expected chunks exist and are non-empty
+    let allExist = true
+    for (let i = 0; i < expectedCount; i++) {
+      const p = chunkPath(candChunksDir, i)
+      try {
+        if (!fs.existsSync(p) || fs.statSync(p).size === 0) {
+          allExist = false
+          break
+        }
+      } catch {
+        allExist = false
+        break
+      }
+    }
+    if (!allExist) continue
+
+    // Reusable chunks found! Hard-link or copy into targetId's chunks dir
+    try {
+      fs.mkdirSync(targetChunksDir, { recursive: true })
+      let linked = 0
+      for (let i = 0; i < expectedCount; i++) {
+        const srcP = chunkPath(candChunksDir, i)
+        const dstP = chunkPath(targetChunksDir, i)
+        if (fs.existsSync(dstP) && fs.statSync(dstP).size > 0) {
+          linked++
+          continue
+        }
+        try {
+          fs.rmSync(dstP, { force: true })
+        } catch {
+          // ignore
+        }
+        try {
+          fs.linkSync(srcP, dstP)
+          linked++
+        } catch {
+          try {
+            fs.copyFileSync(srcP, dstP)
+            linked++
+          } catch (err) {
+            console.warn(`[media] could not link chunk ${i} from scan ${cand.id}:`, err)
+            break
+          }
+        }
+      }
+      if (linked === expectedCount) {
+        console.log(`[media] reused ${expectedCount} movie chunk(s) from scan ${cand.id} → ${targetId}`)
+        return { ok: true, count: expectedCount, sourceId: cand.id }
+      }
+    } catch (err) {
+      console.warn(`[media] failed reusing chunks from scan ${cand.id}:`, err)
+    }
+  }
+
+  return { ok: false, count: 0 }
+}
+
+/**
+ * Check if the re-encoded 480p movie upload copy already exists for THIS exact
+ * movie and trim range from a previous scan. If so, hard-link (or copy) it into
+ * targetId's media dir and return its metadata so 480p re-encoding is skipped.
+ */
+export async function findAndReusePrescanMovie(
+  targetId: string,
+  movieName: string,
+  movieSize: number,
+  trimStart: number,
+  trimEnd: number,
+): Promise<{ ok: boolean; copyPath: string; durationSec: number; sizeBytes: number; reencoded: boolean; sourceId: string } | null> {
+  if (!movieName || !Number.isFinite(movieSize) || movieSize <= 0) return null
+
+  const candidates = listScans()
+    .filter((s) => s.id !== targetId && s.movieName === movieName)
+    .map((s) => getScan(s.id))
+    .filter((s): s is Scan => Boolean(s) && s.movieSize === movieSize)
+
+  const targetCopy = path.join(scanMediaDir(targetId), 'prescan-movie.mp4')
+
+  for (const cand of candidates) {
+    const candStart = cand.movieTrimStart ?? 0
+    const candEnd = cand.movieTrimEnd ?? cand.movieDuration ?? 0
+    if (Math.abs(candStart - trimStart) >= 0.1 || Math.abs(candEnd - trimEnd) >= 0.1) continue
+
+    const candCopy = path.join(scanMediaDir(cand.id), 'prescan-movie.mp4')
+    if (!fs.existsSync(candCopy)) continue
+    const size = fs.statSync(candCopy).size
+    if (size < 1000) continue
+
+    try {
+      fs.mkdirSync(path.dirname(targetCopy), { recursive: true })
+      if (targetCopy !== candCopy) {
+        try {
+          fs.rmSync(targetCopy, { force: true })
+        } catch {
+          // ignore
+        }
+        try {
+          fs.linkSync(candCopy, targetCopy)
+        } catch {
+          fs.copyFileSync(candCopy, targetCopy)
+        }
+      }
+      const durationSec = cand.geminiPrescan?.movieCopy?.durationSec || (await probeDuration(targetCopy))
+      const reencoded = cand.geminiPrescan?.movieCopy?.reencoded ?? true
+      console.log(`[media] reused 480p prescan movie copy from scan ${cand.id} → ${targetId} (${durationSec.toFixed(1)}s, ${size} bytes)`)
+      return {
+        ok: true,
+        copyPath: targetCopy,
+        durationSec,
+        sizeBytes: size,
+        reencoded,
+        sourceId: cand.id,
+      }
+    } catch (err) {
+      console.warn(`[media] failed reusing prescan movie copy from scan ${cand.id}:`, err)
+    }
+  }
+
+  return null
+}
+
+/**
+ * Find if the prescan movie copy is already active in Gemini Files API on this key
+ * from an earlier scan of the same movie and trim (cached ≤ 47h).
+ */
+export function findReusableGeminiMovieUpload(
+  movieName: string,
+  movieSize: number,
+  keyId: string,
+  trimStart: number,
+  trimEnd: number,
+  excludeId?: string,
+): { movieUri: string; movieName: string; uploadedAt: number; sourceId: string } | null {
+  if (!movieName || !Number.isFinite(movieSize) || movieSize <= 0) return null
+
+  const candidates = listScans()
+    .filter((s) => s.id !== excludeId && s.movieName === movieName)
+    .map((s) => getScan(s.id))
+    .filter((s): s is Scan => Boolean(s) && s.movieSize === movieSize)
+
+  for (const cand of candidates) {
+    const candStart = cand.movieTrimStart ?? 0
+    const candEnd = cand.movieTrimEnd ?? cand.movieDuration ?? 0
+    if (Math.abs(candStart - trimStart) >= 0.1 || Math.abs(candEnd - trimEnd) >= 0.1) continue
+
+    const up = cand.geminiPrescan?.uploads?.[keyId]
+    if (up?.movieName && up?.movieUri && Date.now() - (up.uploadedAt || 0) < 47 * 3600 * 1000) {
+      return { movieUri: up.movieUri, movieName: up.movieName, uploadedAt: up.uploadedAt, sourceId: cand.id }
+    }
+  }
+  return null
+}
+
 // ---------- Storage usage (local EBS disk) ----------
 
 export const STORAGE_LIMIT_BYTES = DISK_LIMIT_BYTES
 
 let usageCache: { used: number; at: number } | null = null
 
-function dirSize(dir: string): number {
+function dirSize(dir: string, seenInodes = new Set<number>()): number {
   let total = 0
   let entries: fs.Dirent[]
   try {
@@ -221,8 +408,14 @@ function dirSize(dir: string): number {
   for (const e of entries) {
     const p = path.join(dir, e.name)
     try {
-      if (e.isDirectory()) total += dirSize(p)
-      else if (e.isFile()) total += fs.statSync(p).size
+      if (e.isDirectory()) total += dirSize(p, seenInodes)
+      else if (e.isFile()) {
+        const st = fs.statSync(p)
+        if (!seenInodes.has(st.ino)) {
+          seenInodes.add(st.ino)
+          total += st.size
+        }
+      }
     } catch {
       // file vanished mid-walk
     }

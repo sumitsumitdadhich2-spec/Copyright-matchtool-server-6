@@ -121,17 +121,19 @@ export function ComparePanel({ scan }: { scan: Scan }) {
         <div className="ml-auto flex items-center gap-2">
           <button
             type="button"
-            onClick={() => setIdx((i) => Math.max(0, i - 1))}
-            disabled={idx === 0}
+            onClick={() => setIdx((i) => (pairs.length > 0 ? (i - 1 + pairs.length) % pairs.length : 0))}
+            disabled={pairs.length <= 1}
             className="flex items-center gap-1 rounded-md border border-input px-3 py-1.5 text-xs font-medium hover:bg-secondary disabled:opacity-40"
+            title="Previous match (cycles)"
           >
             <ChevronLeft className="size-3.5" aria-hidden /> Previous
           </button>
           <button
             type="button"
-            onClick={() => setIdx((i) => Math.min(pairs.length - 1, i + 1))}
-            disabled={idx >= pairs.length - 1}
+            onClick={() => setIdx((i) => (pairs.length > 0 ? (i + 1) % pairs.length : 0))}
+            disabled={pairs.length <= 1}
             className="flex items-center gap-1 rounded-md border border-input px-3 py-1.5 text-xs font-medium hover:bg-secondary disabled:opacity-40"
+            title="Next match (cycles)"
           >
             Next <ChevronRight className="size-3.5" aria-hidden />
           </button>

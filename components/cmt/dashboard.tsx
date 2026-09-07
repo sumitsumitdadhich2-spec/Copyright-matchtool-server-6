@@ -2,7 +2,7 @@
 
 import { useState } from 'react'
 import useSWR from 'swr'
-import { Play, Square, RotateCcw, Loader2, LogOut, ScanSearch, Settings, Users } from 'lucide-react'
+import { Play, Square, RotateCcw, Loader2, LogOut, ScanSearch, Settings, Users, ShieldCheck, ShieldX } from 'lucide-react'
 import type { Scan, MinuteFinderMode } from '@/lib/types'
 import { fetcher } from '@/lib/format'
 import { useAuth } from '@/components/auth/auth-gate'
@@ -81,6 +81,32 @@ export function Dashboard() {
   const stoppingInBackground = Boolean(running && status === 'stopped')
   const canStop = running && !stoppingInBackground
 
+  const verifierOn = scan?.verifierEnabled !== false
+
+  async function toggleVerifier() {
+    if (!scan) return
+    const nextState = !verifierOn
+    void mutate({ ...data, scan: { ...scan, verifierEnabled: nextState } } as ScanResponse, false)
+    try {
+      await Promise.all([
+        fetch(`/api/scans/${scan.id}`, {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ verifierEnabled: nextState }),
+        }),
+        fetch('/api/settings', {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ verifierEnabled: nextState }),
+        }),
+      ])
+    } catch {
+      /* ignore and refresh below */
+    } finally {
+      void mutate()
+    }
+  }
+
   async function action(path: string, body?: object) {
     if (!scanId) return
     setBusy(true)
@@ -155,6 +181,38 @@ export function Dashboard() {
               <Loader2 className="size-3.5 animate-spin" aria-hidden />
               Stopping — partial results ready (export niche available)
             </span>
+          )}
+          {scan && (
+            <button
+              type="button"
+              onClick={toggleVerifier}
+              disabled={busy}
+              className={`btn-press flex items-center gap-2 rounded-lg border px-3.5 py-2 text-sm font-semibold transition-all shadow-sm ${
+                verifierOn
+                  ? 'border-emerald-500/60 bg-emerald-500/15 text-emerald-300 hover:bg-emerald-500/25 shadow-emerald-950/25'
+                  : 'border-zinc-700 bg-zinc-800/90 text-zinc-400 hover:bg-zinc-800 hover:text-zinc-200'
+              }`}
+              title={
+                verifierOn
+                  ? 'Verifier is ON (automatic 24fps AI check after chunks). Click to turn OFF.'
+                  : 'Verifier is OFF (no AI verify after chunks — instant raw matches). Click to turn ON.'
+              }
+              aria-label={`Verifier is currently ${verifierOn ? 'ON' : 'OFF'}. Click to toggle.`}
+            >
+              {verifierOn ? (
+                <ShieldCheck className="size-4 text-emerald-400" aria-hidden />
+              ) : (
+                <ShieldX className="size-4 text-zinc-400" aria-hidden />
+              )}
+              <span className="font-medium">Verifier:</span>
+              <span
+                className={`rounded px-1.5 py-0.5 text-xs font-black uppercase tracking-wider ${
+                  verifierOn ? 'bg-emerald-500 text-emerald-950' : 'bg-zinc-700 text-zinc-200'
+                }`}
+              >
+                {verifierOn ? 'ON' : 'OFF'}
+              </span>
+            </button>
           )}
           <button
             type="button"
