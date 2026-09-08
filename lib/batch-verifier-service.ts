@@ -418,21 +418,28 @@ export async function verifySingleMinute(
       if (freshScan.candidateGroups) {
         const group = freshScan.candidateGroups.find(
           (g) =>
-            (Math.abs(g.shortStart - p.shortStart) < 0.35 && Math.abs(g.shortEnd - p.shortEnd) < 0.35) ||
+            sameShortSegment(g.shortStart, g.shortEnd, p.shortStart, p.shortEnd) ||
             Math.max(0, Math.min(g.shortEnd, p.shortEnd) - Math.max(g.shortStart, p.shortStart)) > 0.1,
         )
         if (group) {
+          const candIdx = group.candidates.findIndex(
+            (c) => Math.abs(c.movieStart - p.movieStart) < 0.5,
+          )
           if (isConfirmed) {
             group.status = 'confirmed'
-            const candIdx = group.candidates.findIndex(
-              (c) => Math.abs(c.movieStart - p.movieStart) < 0.5,
-            )
             if (candIdx >= 0) {
               group.confirmedIndex = candIdx
               group.candidates[candIdx].verdict = 'same'
+              group.candidates[candIdx].verifierReason = p.reason
+              group.candidates[candIdx].verifierModel = chosenModel
             }
           } else {
             group.status = 'rejected'
+            if (candIdx >= 0) {
+              group.candidates[candIdx].verdict = 'different'
+              group.candidates[candIdx].verifierReason = p.reason
+              group.candidates[candIdx].verifierModel = chosenModel
+            }
           }
         }
       }

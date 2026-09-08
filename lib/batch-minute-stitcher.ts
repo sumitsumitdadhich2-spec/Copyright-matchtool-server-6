@@ -3,6 +3,7 @@ import path from 'node:path'
 import { MEDIA_DIR, WORK_DIR } from './paths'
 import { runFfmpeg, CancelToken } from './ffmpeg-pool'
 import { probeHasAudio } from './ffmpeg'
+import { sameShortSegment } from './candidate-pick'
 import type { Scan, BatchVerifyPart, ChunkMatch } from './types'
 
 export interface MinuteSegmentPlan {
@@ -53,8 +54,11 @@ export function planMinuteSegments(scan: Scan, minuteIndex: number): MinuteSegme
     const cEnd = Math.min(minEnd, cand.shortEnd)
     if (cEnd - cStart < 0.15) continue
 
-    // Check if this candidate significantly overlaps with any already selected candidate
+    // Check if this candidate represents the same scene or significantly overlaps with any already selected candidate
     const overlaps = chosenMatches.some((chosen) => {
+      if (sameShortSegment(cand.shortStart, cand.shortEnd, chosen.shortStart, chosen.shortEnd)) {
+        return true
+      }
       const chosenStart = Math.max(minStart, chosen.shortStart)
       const chosenEnd = Math.min(minEnd, chosen.shortEnd)
       const oStart = Math.max(cStart, chosenStart)
@@ -62,9 +66,9 @@ export function planMinuteSegments(scan: Scan, minuteIndex: number): MinuteSegme
       const overlapDur = oEnd - oStart
       const shorter = Math.min(cEnd - cStart, chosenEnd - chosenStart)
       return (
-        Math.abs(cand.shortStart - chosen.shortStart) < 0.35 ||
-        overlapDur >= 0.25 ||
-        (shorter > 0 && overlapDur / shorter >= 0.25)
+        Math.abs(cand.shortStart - chosen.shortStart) < 0.45 ||
+        overlapDur >= 0.15 ||
+        (shorter > 0 && overlapDur / shorter >= 0.15)
       )
     })
 
