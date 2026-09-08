@@ -61,7 +61,7 @@ export function originTag(origin: MatchOrigin | undefined, chunkIndex?: number, 
  *  most recent rescan-found window (the rescan had the whole chunk to look at),
  *  otherwise the first (highest-ranked) original candidate. */
 export function bestRejectedCandidate(g: CandidateGroup): { c: CandidateEntry; index: number; viaRescan: boolean } | null {
-  if (g.candidates.length === 0) return null
+  if (!g.candidates || g.candidates.length === 0) return null
   for (let i = g.candidates.length - 1; i >= 0; i--) {
     const c = g.candidates[i]
     if (c.rescan === 'found' && c.rescanMovieStart != null && c.rescanMovieEnd != null && c.rescanMovieEnd > c.rescanMovieStart) {
@@ -144,12 +144,12 @@ export function applyGroupMatches(scan: Scan, g: CandidateGroup): void {
     // Unverified or undecided (pending/verifying/rescanning): keep ONLY the single
     // best candidate (longest duration / highest confidence) in scan.matches so multiple
     // chunk candidates NEVER duplicate, slice, or clutter the stitched preview, compare panel, or timeline!
-    const best = [...g.candidates].sort((a, b) => {
+    const best = [...(g.candidates || [])].sort((a, b) => {
       const aDur = (a.shortEnd ?? g.shortEnd) - (a.shortStart ?? g.shortStart)
       const bDur = (b.shortEnd ?? g.shortEnd) - (b.shortStart ?? g.shortStart)
       if (Math.abs(aDur - bDur) > 0.15) return bDur - aDur
       return (b.confidence || 0) - (a.confidence || 0)
-    })[0] || g.candidates[0]
+    })[0] || (g.candidates ? g.candidates[0] : undefined)
 
     if (best) {
       scan.matches.push({
@@ -236,7 +236,7 @@ export function candidateOptionsFor(scan: Pick<Scan, 'matches' | 'candidateGroup
   const out: CandidateOption[] = []
 
   for (const g of groups) {
-    g.candidates.forEach((c, index) => {
+    ;(g.candidates || []).forEach((c, index) => {
       const push = (viaRescan: boolean, ms: number, me: number) => {
         const isUserPick = !!g.userPick && g.userPick.index === index && g.userPick.viaRescan === viaRescan
         out.push({

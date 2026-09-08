@@ -39,56 +39,76 @@ const CATEGORIES: CategoryDef[] = [
     id: 'batch',
     label: 'Batch 24fps',
     icon: Bot,
-    countMatcher: (l) =>
-      l.msg.toLowerCase().includes('batch') ||
-      l.msg.toLowerCase().includes('stitch') ||
-      l.msg.toLowerCase().includes('verdict') ||
-      l.msg.toLowerCase().includes('confirmed via rescan'),
+    countMatcher: (l) => {
+      const msg = (l?.msg || '').toLowerCase()
+      return (
+        msg.includes('batch') ||
+        msg.includes('stitch') ||
+        msg.includes('verdict') ||
+        msg.includes('confirmed via rescan')
+      )
+    },
   },
   {
     id: 'render',
     label: 'Render & Padding',
     icon: Film,
-    countMatcher: (l) =>
-      l.msg.toLowerCase().includes('render') ||
-      l.msg.toLowerCase().includes('export') ||
-      l.msg.toLowerCase().includes('padding') ||
-      l.msg.toLowerCase().includes('ffmpeg'),
+    countMatcher: (l) => {
+      const msg = (l?.msg || '').toLowerCase()
+      return (
+        msg.includes('render') ||
+        msg.includes('export') ||
+        msg.includes('padding') ||
+        msg.includes('ffmpeg')
+      )
+    },
   },
   {
     id: 'rescan',
     label: 'Scene Rescan',
     icon: Zap,
-    countMatcher: (l) =>
-      l.msg.toLowerCase().includes('rescan') ||
-      l.msg.toLowerCase().includes('targeted') ||
-      l.msg.toLowerCase().includes('re-tested'),
+    countMatcher: (l) => {
+      const msg = (l?.msg || '').toLowerCase()
+      return (
+        msg.includes('rescan') ||
+        msg.includes('targeted') ||
+        msg.includes('re-tested')
+      )
+    },
   },
   {
     id: 'scan',
     label: 'AI Scanner',
     icon: Search,
-    countMatcher: (l) =>
-      l.msg.toLowerCase().includes('chunk') ||
-      l.msg.toLowerCase().includes('mapping short') ||
-      l.msg.toLowerCase().includes('segment') ||
-      l.msg.toLowerCase().includes('split'),
+    countMatcher: (l) => {
+      const msg = (l?.msg || '').toLowerCase()
+      return (
+        msg.includes('chunk') ||
+        msg.includes('mapping short') ||
+        msg.includes('segment') ||
+        msg.includes('split')
+      )
+    },
   },
   {
     id: 'alerts',
     label: 'Alerts & Quota',
     icon: AlertTriangle,
-    countMatcher: (l) =>
-      l.level === 'warn' ||
-      l.level === 'error' ||
-      l.msg.toLowerCase().includes('quota') ||
-      l.msg.toLowerCase().includes('exhausted') ||
-      l.msg.toLowerCase().includes('rate limit'),
+    countMatcher: (l) => {
+      const msg = (l?.msg || '').toLowerCase()
+      return (
+        l?.level === 'warn' ||
+        l?.level === 'error' ||
+        msg.includes('quota') ||
+        msg.includes('exhausted') ||
+        msg.includes('rate limit')
+      )
+    },
   },
 ]
 
-function getLogCategoryTag(msg: string, level: string) {
-  const m = msg.toLowerCase()
+function getLogCategoryTag(msg: string | undefined, level: string | undefined) {
+  const m = (msg || '').toLowerCase()
   if (m.includes('[batch verifier]') || m.includes('batch verify') || m.includes('stitched')) {
     return {
       label: 'BATCH 24FPS',
@@ -138,24 +158,27 @@ export function LogsPanel({ scan }: { scan: Scan }) {
   const [copied, setCopied] = useState(false)
   const boxRef = useRef<HTMLDivElement>(null)
 
+  const logs = Array.isArray(scan.logs) ? scan.logs : []
+
   // Auto-scroll when new logs arrive (if autoScroll is enabled)
   useEffect(() => {
     if (autoScroll && boxRef.current) {
       boxRef.current.scrollTop = boxRef.current.scrollHeight
     }
-  }, [scan.logs.length, autoScroll])
+  }, [logs.length, autoScroll])
 
   // Compute category counts
   const categoryCounts = useMemo(() => {
     const counts: Record<LogCategory, number> = {
-      all: scan.logs.length,
+      all: logs.length,
       batch: 0,
       render: 0,
       rescan: 0,
       scan: 0,
       alerts: 0,
     }
-    for (const l of scan.logs) {
+    for (const l of logs) {
+      if (!l) continue
       for (const cat of CATEGORIES) {
         if (cat.id !== 'all' && cat.countMatcher(l)) {
           counts[cat.id]++
@@ -163,7 +186,7 @@ export function LogsPanel({ scan }: { scan: Scan }) {
       }
     }
     return counts
-  }, [scan.logs])
+  }, [logs])
 
   // Filter logs by active category and search
   const filteredLogs = useMemo(() => {
@@ -171,12 +194,13 @@ export function LogsPanel({ scan }: { scan: Scan }) {
     const matcher = activeCat ? activeCat.countMatcher : () => true
     const q = search.trim().toLowerCase()
 
-    return scan.logs.filter((l) => {
+    return logs.filter((l) => {
+      if (!l) return false
       if (!matcher(l)) return false
-      if (q && !l.msg.toLowerCase().includes(q)) return false
+      if (q && !(l.msg || '').toLowerCase().includes(q)) return false
       return true
     })
-  }, [scan.logs, category, search])
+  }, [logs, category, search])
 
   // Current live status calculation for the panel header
   const liveSummary = useMemo(() => {

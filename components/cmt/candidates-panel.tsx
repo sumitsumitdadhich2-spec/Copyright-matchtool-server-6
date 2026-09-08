@@ -18,7 +18,7 @@ const GROUP_BADGE: Record<CandidateGroup['status'], { label: string; cls: string
 
 export function CandidatesPanel({ scan }: { scan: Scan }) {
   const groups = scan.candidateGroups ?? []
-  const totalCandidates = groups.reduce((n, g) => n + g.candidates.length, 0)
+  const totalCandidates = groups.reduce((n, g) => n + (g.candidates ? g.candidates.length : 0), 0)
 
   return (
     <section aria-label="Match candidates" className="panel">
@@ -47,8 +47,9 @@ export function CandidatesPanel({ scan }: { scan: Scan }) {
 }
 
 function GroupCard({ scan, g }: { scan: Scan; g: CandidateGroup }) {
-  const badge = GROUP_BADGE[g.status]
+  const badge = GROUP_BADGE[g.status] || { label: g.status || 'Pending', cls: 'bg-muted text-muted-foreground' }
   const busy = g.status === 'verifying' || g.status === 'rescanning'
+  const candidates = g.candidates || []
   return (
     <div className="rounded-md border border-border bg-background p-3">
       <div className="flex flex-wrap items-center gap-2">
@@ -62,7 +63,7 @@ function GroupCard({ scan, g }: { scan: Scan; g: CandidateGroup }) {
         <span className="rounded-full bg-secondary px-2 py-0.5 font-mono text-xs text-muted-foreground">{originLabel(g.origin, g.originWindow)}</span>
       </div>
       <div className="mt-2 grid gap-2">
-        {g.candidates.map((c, i) => (
+        {candidates.map((c, i) => (
           <CandidateRow key={i} scan={scan} g={g} c={c} index={i} />
         ))}
       </div>

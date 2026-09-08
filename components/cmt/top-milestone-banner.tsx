@@ -1,7 +1,7 @@
 'use client'
 
-import { useState, useEffect, useRef } from 'react'
-import { Film, CheckCircle2, Video, Sparkles, Download, X, Bell } from 'lucide-react'
+import { useState, useEffect, useRef, useCallback } from 'react'
+import { Film, CheckCircle2, Video, Sparkles, Download, X } from 'lucide-react'
 import type { Scan } from '@/lib/types'
 
 export type MilestoneType =
@@ -123,6 +123,11 @@ export function TopMilestoneBanner({ scan, onSelectScan }: TopMilestoneBannerPro
   // Tracking state refs to prevent duplicate triggers
   const knownStates = useRef<Record<string, Record<MilestoneType, boolean>>>({})
 
+  const triggerNotification = useCallback((notif: MilestoneNotification) => {
+    setNotification(notif)
+    playMilestoneSound(notif.type)
+  }, [])
+
   useEffect(() => {
     if (!scan) return
 
@@ -221,12 +226,7 @@ export function TopMilestoneBanner({ scan, onSelectScan }: TopMilestoneBannerPro
         createdAt: Date.now(),
       })
     }
-  }, [scan])
-
-  function triggerNotification(notif: MilestoneNotification) {
-    setNotification(notif)
-    playMilestoneSound(notif.type)
-  }
+  }, [scan, triggerNotification])
 
   if (!notification) return null
 

@@ -29,7 +29,7 @@ export function computeScanTiming(scan: Scan | null | undefined): ScanTimingBrea
   const logs = Array.isArray(scan.logs) ? scan.logs : []
 
   // 1. Chunk Slicing / Video Preparation Time
-  let chunkPrepStart: number | null = scan.createdAt || null
+  const chunkPrepStart: number | null = scan.createdAt || null
   let chunkPrepEnd: number | null = null
   const prepDoneLog = logs.find((l) => l?.msg && (l.msg.includes('Chunks prepared') || l.msg.includes('Chunking complete')))
   if (prepDoneLog) {
@@ -37,7 +37,7 @@ export function computeScanTiming(scan: Scan | null | undefined): ScanTimingBrea
   } else if (scan.startedAt && chunkPrepStart) {
     chunkPrepEnd = Math.max(chunkPrepStart, scan.startedAt)
   }
-  let chunkPrepMs = (chunkPrepStart && chunkPrepEnd && chunkPrepEnd >= chunkPrepStart) ? chunkPrepEnd - chunkPrepStart : 0
+  const chunkPrepMs = (chunkPrepStart && chunkPrepEnd && chunkPrepEnd >= chunkPrepStart) ? chunkPrepEnd - chunkPrepStart : 0
 
   // 2. Gemini Minute Finder / Prescan Time
   let prescanStart: number | null = scan.geminiPrescan?.startedAt || null
@@ -50,16 +50,16 @@ export function computeScanTiming(scan: Scan | null | undefined): ScanTimingBrea
     const lastPrescanLog = logs.slice().reverse().find((l) => l?.msg && (l.msg.includes('Minute finder complete') || l.msg.includes('Prescan done')))
     if (lastPrescanLog) prescanEnd = lastPrescanLog.t
   }
-  let prescanMs = (prescanStart && prescanEnd && prescanEnd >= prescanStart) ? prescanEnd - prescanStart : 0
+  const prescanMs = (prescanStart && prescanEnd && prescanEnd >= prescanStart) ? prescanEnd - prescanStart : 0
 
   // 3. AI Parallel Chunk Mapping Scan Time
   let chunkScanStart: number | null = scan.startedAt || null
-  let chunkScanEnd: number | null = scan.finishedAt || null
+  const chunkScanEnd: number | null = scan.finishedAt || null
   if (!chunkScanStart) {
     const startLog = logs.find((l) => l?.msg && (l.msg.includes('Scan started') || l.msg.includes('Scanning minute')))
     if (startLog) chunkScanStart = startLog.t
   }
-  let chunkScanMs = (scan.report?.totalScanTimeMs && scan.report.totalScanTimeMs > 0)
+  const chunkScanMs = (scan.report?.totalScanTimeMs && scan.report.totalScanTimeMs > 0)
     ? scan.report.totalScanTimeMs
     : (chunkScanStart && chunkScanEnd && chunkScanEnd >= chunkScanStart)
     ? chunkScanEnd - chunkScanStart
@@ -87,7 +87,7 @@ export function computeScanTiming(scan: Scan | null | undefined): ScanTimingBrea
     const vDoneLog = logs.slice().reverse().find((l) => l?.msg && (l.msg.includes('Batch verification complete') || l.msg.includes('Verifier finished')))
     if (vDoneLog) verifierEnd = vDoneLog.t
   }
-  let verifierMs = (verifierStart && verifierEnd && verifierEnd >= verifierStart) ? verifierEnd - verifierStart : 0
+  const verifierMs = (verifierStart && verifierEnd && verifierEnd >= verifierStart) ? verifierEnd - verifierStart : 0
 
   // 6. Missing Scene Finder / Gap Backup Time
   let missingStart: number | null = scan.gapBackup?.startedAt || scan.missingSceneScan?.startedAt || null
@@ -100,7 +100,7 @@ export function computeScanTiming(scan: Scan | null | undefined): ScanTimingBrea
     const mDoneLog = logs.slice().reverse().find((l) => l?.msg && (l.msg.includes('Gap backup complete') || l.msg.includes('Missing scene scan done')))
     if (mDoneLog) missingEnd = mDoneLog.t
   }
-  let missingMs = (missingStart && missingEnd && missingEnd >= missingStart) ? missingEnd - missingStart : 0
+  const missingMs = (missingStart && missingEnd && missingEnd >= missingStart) ? missingEnd - missingStart : 0
 
   // 7. Video Export & FFmpeg Stitching Render Time
   let renderStart: number | null = scan.renderJob?.startedAt || null

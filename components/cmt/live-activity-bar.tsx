@@ -45,9 +45,11 @@ export function LiveActivityBar({ scan, onScrollToLogs }: LiveActivityBarProps) 
     const renderSegments = scan.renderJob?.segmentCount ?? 0
 
     // 3. Rescan active check (look at most recent logs)
-    const recentLogs = scan.logs.slice(-5)
+    const logs = Array.isArray(scan.logs) ? scan.logs : []
+    const recentLogs = logs.slice(-5)
     const activeRescanLog = recentLogs.find(
       (l) =>
+        l?.msg &&
         l.msg.includes('[Rescan Scene]') &&
         !l.msg.includes('SUCCESS:') &&
         !l.msg.includes('Failed:') &&
@@ -169,7 +171,8 @@ export function LiveActivityBar({ scan, onScrollToLogs }: LiveActivityBarProps) 
     }
   }, [scan])
 
-  const latestLog = scan.logs[scan.logs.length - 1]
+  const logs = Array.isArray(scan.logs) ? scan.logs : []
+  const latestLog = logs[logs.length - 1]
 
   const handleScrollToLogs = () => {
     if (onScrollToLogs) {

@@ -119,7 +119,11 @@ export function CandidateChooser({
   const canPrev = hasMultiple
   const canNext = hasMultiple
   const userPicked = options.some((o) => o.isUserPick)
-  const badge = viewing ? STATE_BADGE[viewing.state] : mainOpt ? STATE_BADGE.main : null
+  const badge = viewing
+    ? STATE_BADGE[viewing.state] || { label: viewing.state || 'candidate', cls: 'bg-muted text-muted-foreground' }
+    : mainOpt
+    ? STATE_BADGE.main
+    : null
 
   return (
     <div
