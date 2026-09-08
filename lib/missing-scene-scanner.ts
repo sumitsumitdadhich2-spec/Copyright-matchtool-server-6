@@ -218,10 +218,18 @@ async function runMissingSceneScanner(
     }
 
     // Check if movie copy is already on Gemini Files API
-    let movieUploadUri = scan.geminiPrescan?.uploads?.[Object.keys(scan.geminiPrescan?.uploads || {})[0]]?.movieUri
+    const primaryKeyId = apiKeyHash(primaryApiKey)
+    let movieUploadUri = scan.geminiPrescan?.uploads?.[primaryKeyId]?.movieUri
 
     if (!movieUploadUri) {
-      const reusableUpload = await findReusableGeminiMovieUpload(primaryApiKey, movieCopyPath)
+      const reusableUpload = findReusableGeminiMovieUpload(
+        scan.movieName || '',
+        scan.movieSize || 0,
+        primaryKeyId,
+        trimStart,
+        trimEnd,
+        scanId,
+      )
       if (reusableUpload) {
         movieUploadUri = reusableUpload.uri
       } else {
@@ -293,15 +301,12 @@ PART <n>: NOT FOUND — not in this 20-minute window`
 
       let releaseGlobalLock: ((sec?: number) => void) | null = null
       try {
-        const apiKeys = scan.apiKeys && scan.apiKeys.length > 0 ? scan.apiKeys : [primaryApiKey]
-        const candLanes = apiKeys.flatMap((k, ki) =>
-          CHUNK_MODEL_POOL.map((m) => ({
-            apiKey: k,
-            keyIdx: ki + 1,
-            modelId: m.id,
-            rpd: m.rpd,
-          })),
-        )
+        const candLanes = CHUNK_MODEL_POOL.map((m) => ({
+          apiKey: primaryApiKey,
+          keyIdx: 1,
+          modelId: m.id,
+          rpd: m.rpd,
+        }))
 
         const { selected, release } = await globalGeminiCoordinator.acquireFirstAvailableLane({
           scanId,

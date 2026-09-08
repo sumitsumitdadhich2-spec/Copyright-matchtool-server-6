@@ -455,20 +455,27 @@ async function run(id: string, ctrl: Ctrl, apiKeys: string[], user: FinderUser):
   const allKeys = apiKeys.map((k, i) => ({ keyIdx: i + 1, apiKey: k, keyId: apiKeyHash(k), ai: getClient(k) }))
   persist(id, ctrl, { status: 'uploading', progress: `Uploading to Gemini (0/${allKeys.length} keys)...` })
   let uploadedKeys = 0
-  const uploadResults = await Promise.all(
-    allKeys.map(async (k) => {
+  const uploadResults: boolean[] = new Array(allKeys.length).fill(false)
+  const UPLOAD_CONCURRENCY = 2
+  let keyCursor = 0
+  const workers = Array.from({ length: Math.min(UPLOAD_CONCURRENCY, allKeys.length) }, async () => {
+    while (keyCursor < allKeys.length) {
+      if (ctrl.stopping) return
+      const i = keyCursor++
+      const k = allKeys[i]
       try {
         await ensureUploads(id, ctrl, k.keyId, k.keyIdx, k.ai, shortFile, copyPath)
         uploadedKeys += 1
+        uploadResults[i] = true
         persist(id, ctrl, { progress: `Uploading to Gemini (${uploadedKeys}/${allKeys.length} keys)...` })
-        return true
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err)
         log(id, 'error', `Key ${k.keyIdx}: upload failed — is key ko skip kar rahe hain: ${msg.slice(0, 160)}`)
-        return false
+        uploadResults[i] = false
       }
-    }),
-  )
+    }
+  })
+  await Promise.all(workers)
   if (ctrl.stopping) return
   const lanesByKey = allKeys.filter((_, i) => uploadResults[i])
   if (lanesByKey.length === 0) {
@@ -791,7 +798,7 @@ async function laneWorker(id: string, ctrl: Ctrl, lane: Lane, env: LaneEnv, pass
     try {
       releaseGlobalLock = await globalGeminiCoordinator.acquireLane({
         scanId: id,
-        scanTitle: ctrl.scan.shortName || id,
+        scanTitle: getScan(id)?.shortName || id,
         apiKey: lane.apiKey,
         keyIdx: lane.keyIdx,
         modelId: lane.model.id,
