@@ -1,7 +1,7 @@
 import { NextResponse } from 'next/server'
 import { getScan, saveScan, addLog } from '@/lib/store'
 import { scheduler } from '@/lib/scheduler'
-import { applyGroupMatches } from '@/lib/candidate-pick'
+import { applyGroupMatches, sameShortSegment } from '@/lib/candidate-pick'
 import { fmtTime } from '@/lib/format'
 import { getSession } from '@/lib/users'
 import { invalidateRenderedOutput, isRenderActive } from '@/lib/render'
@@ -34,6 +34,12 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
     groupId?: string
     candidateIndex?: number | null
     viaRescan?: boolean
+    shortStart?: number
+    shortEnd?: number
+    movieStart?: number
+    movieEnd?: number
+    chunkIndex?: number
+    model?: string
   }
 
   if (scheduler.isRunning(id)) {
@@ -49,7 +55,10 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
     invalidateRenderedOutput(scan)
     return NextResponse.json({ ok: true })
   }
-  const g = (scan.candidateGroups || []).find((x) => x.id === body.groupId)
+  let g = (scan.candidateGroups || []).find((x) => x.id === body.groupId)
+  if (!g && body.shortStart != null && body.shortEnd != null) {
+    g = (scan.candidateGroups || []).find((x) => sameShortSegment(x.shortStart, x.shortEnd, body.shortStart!, body.shortEnd!))
+  }
   if (!g) return NextResponse.json({ error: 'Candidate group not found' }, { status: 404 })
 
   if (body.candidateIndex === null) {
@@ -57,9 +66,30 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
     applyGroupMatches(scan, g)
     addLog(scan, 'info', `User choice cleared for short ${fmtTime(g.shortStart)}–${fmtTime(g.shortEnd)} — AI verdict (${g.status}) restored`)
   } else {
-    const idx = Number(body.candidateIndex)
-    if (!Number.isInteger(idx) || idx < 0 || idx >= g.candidates.length) {
-      return NextResponse.json({ error: 'Invalid candidate index' }, { status: 400 })
+    let idx = Number(body.candidateIndex)
+    if (idx < 0 || idx >= g.candidates.length) {
+      if (body.movieStart != null && body.movieEnd != null) {
+        const found = g.candidates.findIndex(
+          (c) => Math.abs(c.movieStart - body.movieStart!) < 0.5 && Math.abs(c.movieEnd - body.movieEnd!) < 0.5,
+        )
+        if (found >= 0) {
+          idx = found
+        } else {
+          idx = g.candidates.length
+          g.candidates.push({
+            shortStart: body.shortStart ?? g.shortStart,
+            shortEnd: body.shortEnd ?? g.shortEnd,
+            movieStart: body.movieStart,
+            movieEnd: body.movieEnd,
+            chunkIndex: body.chunkIndex ?? 0,
+            model: body.model ?? 'gemini-3.7-flash',
+            verdict: 'same',
+            rescan: 'none',
+          })
+        }
+      } else {
+        return NextResponse.json({ error: 'Invalid candidate index' }, { status: 400 })
+      }
     }
     const c = g.candidates[idx]
     const viaRescan = body.viaRescan === true

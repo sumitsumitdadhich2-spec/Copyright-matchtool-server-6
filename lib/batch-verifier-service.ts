@@ -7,6 +7,7 @@ import { uploadVideo, deleteFileQuiet, extractResponseText, classifyError, getCl
 import { planMinuteSegments, stitchMinuteVerificationClips } from './batch-minute-stitcher'
 import { buildBatchVerifierPrompt, fmtMs } from './batch-verifier-prompt'
 import { CancelToken } from './ffmpeg-pool'
+import { sameShortSegment } from './candidate-pick'
 import type { Scan, BatchMinuteResult, BatchVerifyPart, BatchVerifyState } from './types'
 
 const BATCH_VERIFY_MODELS = ['gemini-3.7-flash', 'gemini-3.8-flash', 'gemini-3.6-flash']
@@ -381,17 +382,31 @@ export async function verifySingleMinute(
           match.verified = true
           match.rejected = false
 
-          // Remove any unconfirmed duplicate competing candidates for this same short segment
+          // Remove any duplicate / competing candidates for this same short segment
           // from scan.matches so they never pollute side-by-side or corrupt merge preview
           freshScan.matches = freshScan.matches.filter((m) => {
             if (m === match) return true
-            const isDup =
-              !m.userPick &&
-              !m.verified &&
-              m.batchVerified !== 'confirmed' &&
-              (Math.abs(m.shortStart - match!.shortStart) < 0.35 ||
-                Math.max(0, Math.min(m.shortEnd, match!.shortEnd) - Math.max(m.shortStart, match!.shortStart)) > 0.15)
-            return !isDup
+            if (m.userPick) return true // User pick is preserved
+
+            const overlap = Math.min(m.shortEnd, match!.shortEnd) - Math.max(m.shortStart, match!.shortStart)
+            const shorter = Math.min(m.shortEnd - m.shortStart, match!.shortEnd - match!.shortStart)
+            const isConflict =
+              Math.abs(m.shortStart - match!.shortStart) < 0.35 ||
+              overlap > 0.25 ||
+              (shorter > 0 && overlap / shorter >= 0.25)
+
+            if (!isConflict) return true
+
+            // If m is not confirmed, drop it
+            if (m.batchVerified !== 'confirmed' && !m.verified) return false
+
+            // If BOTH are confirmed, the one with longer duration or higher confidence stays
+            const mDur = m.shortEnd - m.shortStart
+            const matchDur = match!.shortEnd - match!.shortStart
+            if (matchDur >= mDur) {
+              return false
+            }
+            return true
           })
         } else {
           match.verified = false
@@ -423,8 +438,115 @@ export async function verifySingleMinute(
       }
     }
 
-    // Keep matches sorted cleanly by short timeline and sync with report
-    freshScan.matches.sort((a, b) => a.shortStart - b.shortStart || a.movieStart - b.movieStart)
+    // Deduplicate freshScan.matches to guarantee NO overlapping matches ever exist on the timeline
+    const deduplicatedMatches: ChunkMatch[] = []
+    const sortedMatches = [...freshScan.matches].sort((a, b) => {
+      if (Math.abs(a.shortStart - b.shortStart) > 0.2) {
+        return a.shortStart - b.shortStart
+      }
+      const aPick = a.userPick ? 1 : 0
+      const bPick = b.userPick ? 1 : 0
+      if (aPick !== bPick) return bPick - aPick
+
+      const aConf = (a.verified || a.batchVerified === 'confirmed') ? 1 : 0
+      const bConf = (b.verified || b.batchVerified === 'confirmed') ? 1 : 0
+      if (aConf !== bConf) return bConf - aConf
+
+      const aDur = a.shortEnd - a.shortStart
+      const bDur = b.shortEnd - b.shortStart
+      if (Math.abs(aDur - bDur) > 0.1) return bDur - aDur
+
+      return (b.confidence || 0) - (a.confidence || 0)
+    })
+
+    for (const m of sortedMatches) {
+      const conflictIndex = deduplicatedMatches.findIndex((existing) =>
+        sameShortSegment(existing.shortStart, existing.shortEnd, m.shortStart, m.shortEnd),
+      )
+
+      if (conflictIndex === -1) {
+        deduplicatedMatches.push(m)
+      } else {
+        const existing = deduplicatedMatches[conflictIndex]
+        const existingPriority =
+          (existing.userPick ? 10000 : 0) +
+          ((existing.verified || existing.batchVerified === 'confirmed') ? 1000 : 0) +
+          (existing.shortEnd - existing.shortStart) * 10 +
+          (existing.confidence || 0)
+
+        const mPriority =
+          (m.userPick ? 10000 : 0) +
+          ((m.verified || m.batchVerified === 'confirmed') ? 1000 : 0) +
+          (m.shortEnd - m.shortStart) * 10 +
+          (m.confidence || 0)
+
+        const winner = mPriority > existingPriority ? m : existing
+        const loser = mPriority > existingPriority ? existing : m
+
+        if (mPriority > existingPriority) {
+          deduplicatedMatches[conflictIndex] = m
+        }
+
+        // Store the alternative match into CandidateGroups so it appears as a selectable candidate
+        // in side-by-side compare and candidate chooser instead of colliding on the timeline
+        if (!Array.isArray(freshScan.candidateGroups)) freshScan.candidateGroups = []
+        let g = freshScan.candidateGroups.find((x) =>
+          sameShortSegment(x.shortStart, x.shortEnd, winner.shortStart, winner.shortEnd),
+        )
+        if (!g) {
+          g = {
+            id: `g${freshScan.candidateGroups.length}-${Math.random().toString(36).slice(2, 8)}`,
+            shortStart: winner.shortStart,
+            shortEnd: winner.shortEnd,
+            status: winner.verified ? 'confirmed' : 'pending',
+            candidates: [],
+            confirmedIndex: winner.verified ? 0 : null,
+            confirmedViaRescan: false,
+            attempts: 0,
+            origin: winner.origin ?? 'chunk',
+            originWindow: winner.originWindow,
+          }
+          freshScan.candidateGroups.push(g)
+        }
+
+        const hasWinner = g.candidates.some(
+          (c) => c.chunkIndex === winner.chunkIndex && Math.abs(c.movieStart - winner.movieStart) < 0.5,
+        )
+        if (!hasWinner) {
+          g.candidates.unshift({
+            shortStart: winner.shortStart,
+            shortEnd: winner.shortEnd,
+            movieStart: winner.movieStart,
+            movieEnd: winner.movieEnd,
+            chunkIndex: winner.chunkIndex,
+            model: winner.model,
+            confidence: winner.confidence,
+            verdict: winner.verified ? 'same' : winner.rejected ? 'different' : 'pending',
+            rescan: 'none',
+          })
+        }
+
+        const hasLoser = g.candidates.some(
+          (c) => c.chunkIndex === loser.chunkIndex && Math.abs(c.movieStart - loser.movieStart) < 0.5,
+        )
+        if (!hasLoser) {
+          g.candidates.push({
+            shortStart: loser.shortStart,
+            shortEnd: loser.shortEnd,
+            movieStart: loser.movieStart,
+            movieEnd: loser.movieEnd,
+            chunkIndex: loser.chunkIndex,
+            model: loser.model,
+            confidence: loser.confidence,
+            verdict: loser.verified ? 'same' : loser.rejected ? 'different' : 'pending',
+            rescan: 'none',
+          })
+        }
+      }
+    }
+
+    deduplicatedMatches.sort((a, b) => a.shortStart - b.shortStart || a.movieStart - b.movieStart)
+    freshScan.matches = deduplicatedMatches
     if (freshScan.report) {
       freshScan.report.matches = [...freshScan.matches]
     }

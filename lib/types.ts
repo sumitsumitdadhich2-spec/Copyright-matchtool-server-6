@@ -292,12 +292,16 @@ export type RescanState = 'none' | 'pending' | 'rescanning' | 'found' | 'not_fou
 
 /** One movie-window candidate for a short segment (one parsed chunk match). */
 export interface CandidateEntry {
+  /** short video window for this specific candidate (if different from group window) */
+  shortStart?: number
+  shortEnd?: number
   /** ABSOLUTE movie seconds */
   movieStart: number
   movieEnd: number
   chunkIndex: number
   /** model that produced this candidate during the chunk phase */
   model: string
+  confidence?: number
   /** verifier verdict for this exact window */
   verdict: CandidateVerdict
   verifierModel?: string

@@ -28,31 +28,66 @@ export function planMinuteSegments(scan: Scan, minuteIndex: number): MinuteSegme
     }
   }
 
-  // All matches that overlap this minute, prioritizing user picks and verified scenes
+  // All matches that overlap this minute
   const candidateMatches: ChunkMatch[] = (scan.matches || [])
-    .filter((m) => m.shortStart < minEnd && m.shortEnd > minStart)
-    .sort(
-      (a, b) =>
-        a.shortStart - b.shortStart ||
-        Number(b.userPick === true) - Number(a.userPick === true) ||
-        Number(b.verified === true || b.batchVerified === 'confirmed') -
-          Number(a.verified === true || a.batchVerified === 'confirmed') ||
-        (b.confidence || 0) - (a.confidence || 0) ||
-        a.movieStart - b.movieStart,
-    )
+    .filter((m) => m.shortStart < minEnd && m.shortEnd > minStart && m.shortEnd - m.shortStart >= 0.15)
+
+  // Priority scoring function: User pick > Confirmed/Verified > Longer duration > Higher confidence
+  function getMatchPriority(m: ChunkMatch): number {
+    let p = 0
+    if (m.userPick) p += 10000
+    if (m.batchVerified === 'confirmed' || m.verified) p += 1000
+    if (m.rejected || m.batchVerified === 'rejected') p -= 500
+    p += (m.shortEnd - m.shortStart) * 10
+    p += (m.confidence || 0) * 10
+    return p
+  }
+
+  // Sort candidates by priority descending
+  const sortedByPriority = [...candidateMatches].sort((a, b) => getMatchPriority(b) - getMatchPriority(a))
+
+  // Greedily pick non-overlapping candidates that represent the best, authentic scene matches
+  const chosenMatches: ChunkMatch[] = []
+  for (const cand of sortedByPriority) {
+    const cStart = Math.max(minStart, cand.shortStart)
+    const cEnd = Math.min(minEnd, cand.shortEnd)
+    if (cEnd - cStart < 0.15) continue
+
+    // Check if this candidate significantly overlaps with any already selected candidate
+    const overlaps = chosenMatches.some((chosen) => {
+      const chosenStart = Math.max(minStart, chosen.shortStart)
+      const chosenEnd = Math.min(minEnd, chosen.shortEnd)
+      const oStart = Math.max(cStart, chosenStart)
+      const oEnd = Math.min(cEnd, chosenEnd)
+      const overlapDur = oEnd - oStart
+      const shorter = Math.min(cEnd - cStart, chosenEnd - chosenStart)
+      return (
+        Math.abs(cand.shortStart - chosen.shortStart) < 0.35 ||
+        overlapDur >= 0.25 ||
+        (shorter > 0 && overlapDur / shorter >= 0.25)
+      )
+    })
+
+    if (!overlaps) {
+      chosenMatches.push(cand)
+    }
+  }
+
+  // Sort the chosen non-overlapping matches strictly chronologically by shortStart
+  chosenMatches.sort((a, b) => a.shortStart - b.shortStart)
 
   const parts: BatchVerifyPart[] = []
   let runningLocalClock = 0
   let lastEnd = minStart
 
-  for (const m of candidateMatches) {
+  for (const m of chosenMatches) {
     const sStart = Math.max(minStart, m.shortStart)
     const sEnd = Math.min(minEnd, m.shortEnd)
 
     // Skip tiny slices < 0.15s or inverted ranges
     if (sEnd - sStart < 0.15) continue
 
-    // If there's an overlap with previous segment, adjust start
+    // Only adjust for tiny edge jitter (< 0.2s) between consecutive non-conflicting scenes
     const adjustedStart = Math.max(sStart, lastEnd)
     if (sEnd - adjustedStart < 0.15) continue
 

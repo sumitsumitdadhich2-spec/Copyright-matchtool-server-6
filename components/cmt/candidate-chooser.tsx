@@ -96,7 +96,17 @@ export function CandidateChooser({
 
   function makeMain() {
     if (!viewing || viewing.isMain) return
-    void post({ groupId: viewing.groupId, candidateIndex: viewing.index, viaRescan: viewing.viaRescan })
+    void post({
+      groupId: viewing.groupId,
+      candidateIndex: viewing.index,
+      viaRescan: viewing.viaRescan,
+      shortStart: viewing.shortStart,
+      shortEnd: viewing.shortEnd,
+      movieStart: viewing.movieStart,
+      movieEnd: viewing.movieEnd,
+      chunkIndex: viewing.chunkIndex,
+      model: viewing.model,
+    })
   }
 
   function resetToAi() {
@@ -135,13 +145,13 @@ export function CandidateChooser({
         ) : null}
         {viewing && (
           <span className="font-mono text-[10px] text-muted-foreground">
-            movie {fmtTime(viewing.movieStart)}–{fmtTime(viewing.movieEnd)} · chunk {viewing.chunkIndex} · {displayModelName(viewing.model)}
+            short {fmtTime(viewing.shortStart)}–{fmtTime(viewing.shortEnd)} ({(viewing.shortEnd - viewing.shortStart).toFixed(1)}s) · movie {fmtTime(viewing.movieStart)}–{fmtTime(viewing.movieEnd)} · chunk {viewing.chunkIndex} · {displayModelName(viewing.model)}
             {viewing.viaRescan || viewing.origin === 'rescan' ? ' · 🔄 rescan' : ''}
           </span>
         )}
         {!viewing && mainOpt && (
           <span className="font-mono text-[10px] text-muted-foreground">
-            showing MAIN — movie {fmtTime(mainOpt.movieStart)}–{fmtTime(mainOpt.movieEnd)}
+            showing MAIN — short {fmtTime(mainOpt.shortStart)}–{fmtTime(mainOpt.shortEnd)} ({(mainOpt.shortEnd - mainOpt.shortStart).toFixed(1)}s) · movie {fmtTime(mainOpt.movieStart)}–{fmtTime(mainOpt.movieEnd)}
             {mainOpt.viaRescan || mainOpt.origin === 'rescan' ? ' · 🔄 rescan' : mainOpt.isUserPick ? ' · your choice' : ''}
           </span>
         )}

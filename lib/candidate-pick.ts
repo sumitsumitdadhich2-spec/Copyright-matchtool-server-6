@@ -7,12 +7,30 @@ import type { CandidateEntry, CandidateGroup, ChunkMatch, MatchOrigin, Scan } fr
 // and the preview/compare panels (client). No fs / no side effects.
 // ---------------------------------------------------------------------------
 
-/** Two short-video ranges are "the same segment" when they overlap ≥35% of the shorter one or ≥0.4s. */
+/** Two short-video ranges represent the same scene/segment (even with lesser or greater duration)
+ *  when they overlap, start/end near each other, or one is contained in the other. */
 export function sameShortSegment(aStart: number, aEnd: number, bStart: number, bEnd: number): boolean {
   const overlap = Math.min(aEnd, bEnd) - Math.max(aStart, bStart)
-  if (overlap <= 0) return false
-  const shorter = Math.min(aEnd - aStart, bEnd - bStart)
-  return shorter <= 0 ? false : overlap / shorter >= 0.35 || overlap >= 0.4
+  const aLen = Math.max(0.01, aEnd - aStart)
+  const bLen = Math.max(0.01, bEnd - bStart)
+  const shorter = Math.min(aLen, bLen)
+
+  // One is contained within the other (even with different duration)
+  if ((aStart >= bStart - 0.35 && aEnd <= bEnd + 0.35) || (bStart >= aStart - 0.35 && bEnd <= aEnd + 0.35)) {
+    return true
+  }
+
+  // Significant overlap (at least 20% of shorter, or at least 0.2s)
+  if (overlap > 0 && shorter > 0) {
+    if (overlap >= 0.2 || overlap / shorter >= 0.2) return true
+  }
+
+  // Starts or ends close to each other with any positive overlap
+  if (overlap > 0 && (Math.abs(aStart - bStart) < 0.45 || Math.abs(aEnd - bEnd) < 0.45)) {
+    return true
+  }
+
+  return false
 }
 
 /** Provenance of a match produced from group `g`. A rescan-found window is
@@ -74,12 +92,13 @@ export function applyGroupMatches(scan: Scan, g: CandidateGroup): void {
   if (picked && pick) {
     const useRescan = pick.viaRescan && picked.rescanMovieStart != null && picked.rescanMovieEnd != null
     scan.matches.push({
-      shortStart: g.shortStart,
-      shortEnd: g.shortEnd,
+      shortStart: picked.shortStart ?? g.shortStart,
+      shortEnd: picked.shortEnd ?? g.shortEnd,
       movieStart: useRescan ? picked.rescanMovieStart! : picked.movieStart,
       movieEnd: useRescan ? picked.rescanMovieEnd! : picked.movieEnd,
       chunkIndex: picked.chunkIndex,
       model: picked.model,
+      confidence: picked.confidence,
       verified: true,
       viaRescan: useRescan || undefined,
       userPick: true,
@@ -88,28 +107,32 @@ export function applyGroupMatches(scan: Scan, g: CandidateGroup): void {
     })
   } else if (g.status === 'confirmed' && g.confirmedIndex !== null) {
     const c = g.candidates[g.confirmedIndex]
-    scan.matches.push({
-      shortStart: g.shortStart,
-      shortEnd: g.shortEnd,
-      movieStart: g.confirmedViaRescan ? c.rescanMovieStart! : c.movieStart,
-      movieEnd: g.confirmedViaRescan ? c.rescanMovieEnd! : c.movieEnd,
-      chunkIndex: c.chunkIndex,
-      model: c.model,
-      verified: true,
-      viaRescan: g.confirmedViaRescan || undefined,
-      origin: groupMatchOrigin(g, g.confirmedViaRescan),
-      originWindow: g.originWindow,
-    })
+    if (c) {
+      scan.matches.push({
+        shortStart: c.shortStart ?? g.shortStart,
+        shortEnd: c.shortEnd ?? g.shortEnd,
+        movieStart: g.confirmedViaRescan ? c.rescanMovieStart! : c.movieStart,
+        movieEnd: g.confirmedViaRescan ? c.rescanMovieEnd! : c.movieEnd,
+        chunkIndex: c.chunkIndex,
+        model: c.model,
+        confidence: c.confidence,
+        verified: true,
+        viaRescan: g.confirmedViaRescan || undefined,
+        origin: groupMatchOrigin(g, g.confirmedViaRescan),
+        originWindow: g.originWindow,
+      })
+    }
   } else if (g.status === 'rejected' && !g.superseded) {
     const best = bestRejectedCandidate(g)
     if (best) {
       scan.matches.push({
-        shortStart: g.shortStart,
-        shortEnd: g.shortEnd,
+        shortStart: best.c.shortStart ?? g.shortStart,
+        shortEnd: best.c.shortEnd ?? g.shortEnd,
         movieStart: best.viaRescan ? best.c.rescanMovieStart! : best.c.movieStart,
         movieEnd: best.viaRescan ? best.c.rescanMovieEnd! : best.c.movieEnd,
         chunkIndex: best.c.chunkIndex,
         model: best.c.model,
+        confidence: best.c.confidence,
         verified: false,
         rejected: true,
         viaRescan: best.viaRescan || undefined,
@@ -119,17 +142,24 @@ export function applyGroupMatches(scan: Scan, g: CandidateGroup): void {
     }
   } else {
     // Unverified or undecided (pending/verifying/rescanning): keep ONLY the single
-    // best candidate (index 0) in scan.matches so multiple chunk candidates
-    // NEVER duplicate, slice, or clutter the stitched preview, compare panel, or timeline!
-    const best = g.candidates[0]
+    // best candidate (longest duration / highest confidence) in scan.matches so multiple
+    // chunk candidates NEVER duplicate, slice, or clutter the stitched preview, compare panel, or timeline!
+    const best = [...g.candidates].sort((a, b) => {
+      const aDur = (a.shortEnd ?? g.shortEnd) - (a.shortStart ?? g.shortStart)
+      const bDur = (b.shortEnd ?? g.shortEnd) - (b.shortStart ?? g.shortStart)
+      if (Math.abs(aDur - bDur) > 0.15) return bDur - aDur
+      return (b.confidence || 0) - (a.confidence || 0)
+    })[0] || g.candidates[0]
+
     if (best) {
       scan.matches.push({
-        shortStart: g.shortStart,
-        shortEnd: g.shortEnd,
+        shortStart: best.shortStart ?? g.shortStart,
+        shortEnd: best.shortEnd ?? g.shortEnd,
         movieStart: best.movieStart,
         movieEnd: best.movieEnd,
         chunkIndex: best.chunkIndex,
         model: best.model,
+        confidence: best.confidence,
         verified: false,
         origin: groupMatchOrigin(g, false),
         originWindow: g.originWindow,
@@ -214,8 +244,8 @@ export function candidateOptionsFor(scan: Pick<Scan, 'matches' | 'candidateGroup
           groupStatus: g.status,
           index,
           viaRescan,
-          shortStart: g.shortStart,
-          shortEnd: g.shortEnd,
+          shortStart: c.shortStart ?? g.shortStart,
+          shortEnd: c.shortEnd ?? g.shortEnd,
           movieStart: ms,
           movieEnd: me,
           chunkIndex: c.chunkIndex,
@@ -235,10 +265,40 @@ export function candidateOptionsFor(scan: Pick<Scan, 'matches' | 'candidateGroup
     })
   }
 
+  // Include any other chunk matches that claimed this same short segment
+  for (const m of mains) {
+    const already = out.some(
+      (o) =>
+        Math.abs(o.movieStart - m.movieStart) < 0.5 &&
+        Math.abs(o.movieEnd - m.movieEnd) < 0.5 &&
+        Math.abs(o.shortStart - m.shortStart) < 0.5,
+    )
+    if (!already) {
+      out.push({
+        groupId: groups[0]?.id ?? `g-match-${m.chunkIndex}`,
+        groupStatus: m.verified ? 'confirmed' : 'pending',
+        index: -1,
+        viaRescan: false,
+        shortStart: m.shortStart,
+        shortEnd: m.shortEnd,
+        movieStart: m.movieStart,
+        movieEnd: m.movieEnd,
+        chunkIndex: m.chunkIndex,
+        model: m.model,
+        state: m.verified ? 'confirmed' : m.rejected ? 'rejected' : 'pending',
+        isMain: false,
+        isUserPick: !!m.userPick,
+        rejectedKept: isRejectedKept(m),
+        origin: m.origin ?? 'chunk',
+        originWindow: m.originWindow,
+      })
+    }
+  }
+
   // De-duplicate identical windows (adjacent chunks often report the same window).
   const seen = new Set<string>()
   const deduped = out.filter((o) => {
-    const k = `${o.movieStart.toFixed(2)}-${o.movieEnd.toFixed(2)}`
+    const k = `${o.shortStart.toFixed(1)}-${o.shortEnd.toFixed(1)}-${o.movieStart.toFixed(1)}-${o.movieEnd.toFixed(1)}`
     if (seen.has(k)) return false
     seen.add(k)
     return true

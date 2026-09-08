@@ -1183,16 +1183,12 @@ class Scheduler {
 
   // ---------- Candidate + Verifier pipeline ----------
 
-  /** Group all chunk-phase matches by short segment: two matches that claim the
-   *  same short-video segment (≥50% overlap) become candidates of ONE group.
-   *  Candidates are unlimited — every distinct movie window is saved. */
+  /** Group all chunk-phase matches by short segment: matches from different chunks that claim the
+   *  same short-video scene (lesser or greater duration) become candidates of ONE group.
+   *  Candidates are unlimited — every distinct movie window or chunk finding is saved. */
   private buildCandidateGroups(scan: Scan) {
-    // Incremental: existing groups are kept; only UNVERIFIED chunk-phase matches
-    // (verified === undefined) are grouped — so a manually retried chunk's fresh
-    // matches get queued for verification without re-verifying finished groups.
     const groups: CandidateGroup[] = scan.candidateGroups || []
     const sorted = [...(scan.matches || [])]
-      .filter((m) => m.verified === undefined || m.userPick === undefined)
       .sort((a, b) => a.shortStart - b.shortStart || a.movieStart - b.movieStart)
     for (const m of sorted) {
       let g = groups.find((x) => sameShortSegment(x.shortStart, x.shortEnd, m.shortStart, m.shortEnd))
@@ -1201,9 +1197,9 @@ class Scheduler {
           id: `g${groups.length}-${Math.random().toString(36).slice(2, 8)}`,
           shortStart: m.shortStart,
           shortEnd: m.shortEnd,
-          status: 'pending',
+          status: m.verified ? 'confirmed' : 'pending',
           candidates: [],
-          confirmedIndex: null,
+          confirmedIndex: m.verified ? 0 : null,
           confirmedViaRescan: false,
           attempts: 0,
           // PROVENANCE: gap-backup matches carry their origin; everything else is the chunk scan.
@@ -1212,20 +1208,33 @@ class Scheduler {
         }
         groups.push(g)
       }
-      // De-dupe near-identical movie windows (within 0.5s both ends).
+      // Check if this exact chunk match is already a candidate in this group
       const dup = g.candidates.some(
-        (c) => Math.abs(c.movieStart - m.movieStart) < 0.5 && Math.abs(c.movieEnd - m.movieEnd) < 0.5,
+        (c) =>
+          c.chunkIndex === m.chunkIndex &&
+          Math.abs(c.movieStart - m.movieStart) < 0.5 &&
+          Math.abs(c.movieEnd - m.movieEnd) < 0.5,
       )
       if (!dup) {
         g.candidates.push({
+          shortStart: m.shortStart,
+          shortEnd: m.shortEnd,
           movieStart: m.movieStart,
           movieEnd: m.movieEnd,
           chunkIndex: m.chunkIndex,
           model: m.model,
-          verdict: 'pending',
+          confidence: m.confidence,
+          verdict: m.verified ? 'same' : m.rejected ? 'different' : 'pending',
           rescan: 'none',
         })
-        // New evidence for an already-finished group (manual chunk retry) — reopen it.
+        // If this match has longer coverage for the scene and is confirmed/active, update group range
+        const mDur = m.shortEnd - m.shortStart
+        const gDur = g.shortEnd - g.shortStart
+        if (mDur > gDur && (m.verified || (m.confidence || 0) >= 0.5)) {
+          g.shortStart = Math.min(g.shortStart, m.shortStart)
+          g.shortEnd = Math.max(g.shortEnd, m.shortEnd)
+        }
+        // New evidence for an already-finished group (manual chunk retry) — reopen it if unverified.
         if (g.status === 'rejected' || g.status === 'unverified') g.status = 'pending'
       }
     }
@@ -2131,6 +2140,9 @@ class Scheduler {
     )
     scan.matches.push(...matches)
     scan.matches.sort((a, b) => a.shortStart - b.shortStart || a.movieStart - b.movieStart)
+    // Synchronize candidate groups immediately so overlapping matches from other chunks
+    // become alternative candidates of that scene instead of colliding on the timeline
+    this.buildCandidateGroups(scan)
   }
 
   /** Worker: one per (key lane × model). Pulls chunks from the shared queue until drained. */

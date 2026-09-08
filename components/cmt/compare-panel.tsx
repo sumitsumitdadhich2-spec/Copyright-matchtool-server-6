@@ -18,7 +18,7 @@ import {
 import type { Scan } from '@/lib/types'
 import { fmtTime } from '@/lib/format'
 import { displayModelName } from '@/lib/models'
-import { candidateOptionsFor, hasAlternatives } from '@/lib/candidate-pick'
+import { candidateOptionsFor, hasAlternatives, sameShortSegment } from '@/lib/candidate-pick'
 import { CandidateChooser } from './candidate-chooser'
 
 /** Side-by-side preview of matched windows: each parsed "Short X --> Movie Y" line
@@ -39,24 +39,63 @@ export function ComparePanel({ scan }: { scan: Scan }) {
   const { mutate } = useSWRConfig()
   const pairs = useMemo(() => {
     const raw = scan.matches || []
-    // Filter / deduplicate so that if a confirmed / verified match exists for a short window,
-    // competing unverified duplicate candidates for that same window do not appear as separate entries.
-    // They remain cleanly accessible through the Candidate Chooser below.
+    if (raw.length === 0) return []
+
+    // 1. Sort raw by shortStart, with deterministic priority for conflicts:
+    // User pick > Confirmed / Verified > Longer duration > Higher confidence
+    const sorted = [...raw].sort((a, b) => {
+      if (Math.abs(a.shortStart - b.shortStart) > 0.2) {
+        return a.shortStart - b.shortStart
+      }
+      const aPick = a.userPick ? 1 : 0
+      const bPick = b.userPick ? 1 : 0
+      if (aPick !== bPick) return bPick - aPick
+
+      const aConf = (a.verified || a.batchVerified === 'confirmed') ? 1 : 0
+      const bConf = (b.verified || b.batchVerified === 'confirmed') ? 1 : 0
+      if (aConf !== bConf) return bConf - aConf
+
+      const aDur = a.shortEnd - a.shortStart
+      const bDur = b.shortEnd - b.shortStart
+      if (Math.abs(aDur - bDur) > 0.1) return bDur - aDur
+
+      return (b.confidence || 0) - (a.confidence || 0)
+    })
+
+    // 2. Build non-overlapping pairs list. If two matches represent the same short segment
+    // or overlap significantly, KEEP ONLY THE BEST ONE as the main match entry!
+    // The alternative candidate remains accessible in the Candidate Chooser below.
     const out: ChunkMatch[] = []
-    for (const m of raw) {
-      const hasBetterConfirmed = out.some(
-        (existing) =>
-          (existing.verified || existing.userPick || existing.batchVerified === 'confirmed') &&
-          !m.verified &&
-          !m.userPick &&
-          m.batchVerified !== 'confirmed' &&
-          (Math.abs(existing.shortStart - m.shortStart) < 0.35 ||
-            Math.max(0, Math.min(existing.shortEnd, m.shortEnd) - Math.max(existing.shortStart, m.shortStart)) > 0.15),
+    for (const m of sorted) {
+      const conflictIndex = out.findIndex((existing) =>
+        sameShortSegment(existing.shortStart, existing.shortEnd, m.shortStart, m.shortEnd),
       )
-      if (!hasBetterConfirmed) {
+
+      if (conflictIndex === -1) {
         out.push(m)
+      } else {
+        const existing = out[conflictIndex]
+        const existingPriority =
+          (existing.userPick ? 10000 : 0) +
+          ((existing.verified || existing.batchVerified === 'confirmed') ? 1000 : 0) +
+          (existing.rejected || existing.batchVerified === 'rejected' ? -500 : 0) +
+          (existing.shortEnd - existing.shortStart) * 10 +
+          (existing.confidence || 0)
+
+        const mPriority =
+          (m.userPick ? 10000 : 0) +
+          ((m.verified || m.batchVerified === 'confirmed') ? 1000 : 0) +
+          (m.rejected || m.batchVerified === 'rejected' ? -500 : 0) +
+          (m.shortEnd - m.shortStart) * 10 +
+          (m.confidence || 0)
+
+        if (mPriority > existingPriority) {
+          out[conflictIndex] = m
+        }
       }
     }
+
+    out.sort((a, b) => a.shortStart - b.shortStart)
     return out
   }, [scan.matches])
   const [idx, setIdx] = useState(0)
@@ -86,11 +125,11 @@ export function ComparePanel({ scan }: { scan: Scan }) {
   const showChooser = hasAlternatives(options)
   const viewing = candIdx === null ? null : options[Math.min(candIdx, options.length - 1)]
 
-  // Movie-side window actually shown (candidate or the pair's own window).
+  // Movie-side and short-side windows actually shown (candidate or the pair's own window).
   const movieStart = viewing ? viewing.movieStart : pair?.movieStart ?? 0
   const movieEnd = viewing ? viewing.movieEnd : pair?.movieEnd ?? 0
-  const shortStart = pair?.shortStart ?? 0
-  const shortEnd = pair?.shortEnd ?? 0
+  const shortStart = viewing?.shortStart ?? pair?.shortStart ?? 0
+  const shortEnd = viewing?.shortEnd ?? pair?.shortEnd ?? 0
   const shortDur = Math.max(0.1, shortEnd - shortStart)
   const movieDur = Math.max(0.1, movieEnd - movieStart)
 
@@ -431,7 +470,14 @@ export function ComparePanel({ scan }: { scan: Scan }) {
         {/* Short Video View */}
         <figure className="flex flex-col gap-1.5">
           <figcaption className="flex flex-col gap-0.5 text-xs sm:flex-row sm:items-center sm:justify-between">
-            <span className="font-medium text-foreground">Short video</span>
+            <div className="flex items-center gap-1.5">
+              <span className="font-medium text-foreground">Short video</span>
+              {viewing && (Math.abs(viewing.shortStart - (pair?.shortStart ?? 0)) > 0.1 || Math.abs(viewing.shortEnd - (pair?.shortEnd ?? 0)) > 0.1) && (
+                <span className="rounded bg-amber-500/20 px-1 py-0.2 text-[9px] font-mono font-medium text-amber-300">
+                  CANDIDATE DURATION ({(shortEnd - shortStart).toFixed(1)}s)
+                </span>
+              )}
+            </div>
             <span className="font-mono text-muted-foreground text-[11px]">
               {fmtTime(shortStart)} – {fmtTime(shortEnd)}
             </span>
