@@ -2,7 +2,7 @@
 
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { useSWRConfig } from 'swr'
-import { ChevronLeft, ChevronRight, Clapperboard, Download, Loader2, Pause, Play, RotateCcw, Square, X } from 'lucide-react'
+import { ChevronLeft, ChevronRight, Clapperboard, Download, Loader2, Minus, Pause, Play, Plus, RotateCcw, Square, X } from 'lucide-react'
 import { RENDER_FPS_OPTIONS, isRenderFps, type Scan, type RenderFps, type RenderResolution } from '@/lib/types'
 import { fmtTime, fmtBytes } from '@/lib/format'
 import { buildRenderSegments, type RenderSegment } from '@/lib/render-segments'
@@ -22,10 +22,6 @@ const AUDIO_BITRATES = [96, 128, 192, 256, 320]
 
 export function RenderPanel({ scan }: { scan: Scan }) {
   const segments = useMemo(() => buildRenderSegments(scan), [scan])
-  const totalSeconds = useMemo(
-    () => segments.reduce((acc, s) => acc + Math.max(0, s.movieEnd - s.movieStart), 0),
-    [segments],
-  )
   const coverage = useMemo(() => computeShortCoverage(scan), [scan])
 
   // ---- Render settings ----
@@ -34,11 +30,16 @@ export function RenderPanel({ scan }: { scan: Scan }) {
   const savedFps: RenderFps = isRenderFps(previousSettings?.fps) ? previousSettings.fps : 24
   const savedVideoKbps = previousSettings?.videoBitrateKbps ?? 9000
   const savedAudioKbps = previousSettings?.audioBitrateKbps ?? 192
+  const savedHeadPadding = previousSettings?.headPaddingSec ?? 0
+  const savedTailPadding = previousSettings?.tailPaddingSec ?? 0
   const hasSavedSettings = Boolean(previousSettings)
+
   const [resolution, setResolution] = useState<RenderResolution>(savedResolution)
   const [fps, setFps] = useState<RenderFps>(savedFps)
   const [videoKbps, setVideoKbps] = useState(savedVideoKbps)
   const [audioKbps, setAudioKbps] = useState(savedAudioKbps)
+  const [headPaddingSec, setHeadPaddingSec] = useState(savedHeadPadding)
+  const [tailPaddingSec, setTailPaddingSec] = useState(savedTailPadding)
   const [bitrateTouched, setBitrateTouched] = useState(hasSavedSettings)
   const [actionBusy, setActionBusy] = useState(false)
   const [actionError, setActionError] = useState<string | null>(null)
@@ -49,13 +50,36 @@ export function RenderPanel({ scan }: { scan: Scan }) {
   const [downloadError, setDownloadError] = useState<string | null>(null)
   const { mutate } = useSWRConfig()
 
+  const effectiveSegments = useMemo(() => {
+    const headPad = Math.max(0, headPaddingSec)
+    const tailPad = Math.max(0, tailPaddingSec)
+    if (headPad === 0 && tailPad === 0) return segments
+    const maxMovieDur = scan.movieDuration && scan.movieDuration > 0 ? scan.movieDuration : Infinity
+    return segments.map((s) => {
+      const movieStart = Math.max(0, s.movieStart - headPad)
+      const movieEnd = Math.min(maxMovieDur, Math.max(movieStart + 0.05, s.movieEnd + tailPad))
+      return {
+        ...s,
+        movieStart,
+        movieEnd,
+      }
+    })
+  }, [segments, headPaddingSec, tailPaddingSec, scan.movieDuration])
+
+  const totalSeconds = useMemo(
+    () => effectiveSegments.reduce((acc, s) => acc + Math.max(0, s.movieEnd - s.movieStart), 0),
+    [effectiveSegments],
+  )
+
   useEffect(() => {
     setResolution(savedResolution)
     setFps(savedFps)
     setVideoKbps(savedVideoKbps)
     setAudioKbps(savedAudioKbps)
+    setHeadPaddingSec(savedHeadPadding)
+    setTailPaddingSec(savedTailPadding)
     setBitrateTouched(hasSavedSettings)
-  }, [scan.id, savedResolution, savedFps, savedVideoKbps, savedAudioKbps, hasSavedSettings])
+  }, [scan.id, savedResolution, savedFps, savedVideoKbps, savedAudioKbps, savedHeadPadding, savedTailPadding, hasSavedSettings])
 
   function pickResolution(r: RenderResolution) {
     setResolution(r)
@@ -76,7 +100,14 @@ export function RenderPanel({ scan }: { scan: Scan }) {
       const res = await fetch(`/api/scans/${scan.id}/render`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ resolution, fps, videoBitrateKbps: videoKbps, audioBitrateKbps: audioKbps }),
+        body: JSON.stringify({
+          resolution,
+          fps,
+          videoBitrateKbps: videoKbps,
+          audioBitrateKbps: audioKbps,
+          headPaddingSec,
+          tailPaddingSec,
+        }),
       })
       if (!res.ok) {
         const j = await res.json().catch(() => ({}))
@@ -245,7 +276,7 @@ export function RenderPanel({ scan }: { scan: Scan }) {
         </p>
       )}
 
-      <StitchedPreview scan={scan} segments={segments} totalSeconds={totalSeconds} />
+      <StitchedPreview scan={scan} segments={effectiveSegments} totalSeconds={totalSeconds} />
 
       {/* ---- Export controls ---- */}
       <div className="mt-4 rounded-md border border-border bg-background p-3">
@@ -317,6 +348,95 @@ export function RenderPanel({ scan }: { scan: Scan }) {
           </label>
         </div>
 
+        {/* ---- Clip Padding Controls (+ - Steppers) ---- */}
+        <div className="mt-3 rounded-md border border-border/80 bg-muted/40 p-2.5">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <div>
+              <span className="text-xs font-semibold text-foreground">Clip Extra Padding (Per Scene)</span>
+              <p className="text-[11px] text-muted-foreground">
+                Har matched clip ke aage (Head) aur piche (Tail) extra movie footage add karein (same movie source, synced audio/video):
+              </p>
+            </div>
+            {(headPaddingSec > 0 || tailPaddingSec > 0) && (
+              <span className="rounded-full bg-primary/10 border border-primary/30 px-2 py-0.5 text-[11px] font-mono text-primary font-medium">
+                Padding active: +{headPaddingSec}s head / +{tailPaddingSec}s tail
+              </span>
+            )}
+          </div>
+
+          <div className="mt-2 grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+            {/* Head / Start Padding (+ -) */}
+            <div className="flex items-center justify-between rounded-md border border-border bg-background px-3 py-2">
+              <div className="flex flex-col pr-2">
+                <span className="text-xs font-medium text-foreground">Aage ki Padding (Start / Head)</span>
+                <span className="text-[11px] text-muted-foreground">
+                  {headPaddingSec > 0 ? `Movie start se pehle +${headPaddingSec}s extra` : 'Normal (0s extra start)'}
+                </span>
+              </div>
+              <div className="flex items-center gap-1.5 shrink-0">
+                <button
+                  type="button"
+                  onClick={() => setHeadPaddingSec((prev) => Math.max(0, prev - 1))}
+                  disabled={rendering || headPaddingSec <= 0}
+                  className="flex h-7 w-7 items-center justify-center rounded border border-border bg-secondary text-foreground hover:bg-secondary/80 active:scale-95 disabled:opacity-40 disabled:pointer-events-none transition-all cursor-pointer font-bold text-xs"
+                  title="1 second aage se kam karein (-)"
+                  aria-label="Decrease start padding"
+                >
+                  <Minus className="size-3.5" />
+                </button>
+                <span className="w-10 text-center font-mono text-xs font-semibold text-primary">
+                  +{headPaddingSec}s
+                </span>
+                <button
+                  type="button"
+                  onClick={() => setHeadPaddingSec((prev) => Math.min(60, prev + 1))}
+                  disabled={rendering || headPaddingSec >= 60}
+                  className="flex h-7 w-7 items-center justify-center rounded border border-border bg-secondary text-foreground hover:bg-secondary/80 active:scale-95 disabled:opacity-40 disabled:pointer-events-none transition-all cursor-pointer font-bold text-xs"
+                  title="1 second aage add karein (+)"
+                  aria-label="Increase start padding"
+                >
+                  <Plus className="size-3.5" />
+                </button>
+              </div>
+            </div>
+
+            {/* Tail / End Padding (+ -) */}
+            <div className="flex items-center justify-between rounded-md border border-border bg-background px-3 py-2">
+              <div className="flex flex-col pr-2">
+                <span className="text-xs font-medium text-foreground">Piche ki Padding (End / Tail)</span>
+                <span className="text-[11px] text-muted-foreground">
+                  {tailPaddingSec > 0 ? `Movie end ke baad +${tailPaddingSec}s extra` : 'Normal (0s extra end)'}
+                </span>
+              </div>
+              <div className="flex items-center gap-1.5 shrink-0">
+                <button
+                  type="button"
+                  onClick={() => setTailPaddingSec((prev) => Math.max(0, prev - 1))}
+                  disabled={rendering || tailPaddingSec <= 0}
+                  className="flex h-7 w-7 items-center justify-center rounded border border-border bg-secondary text-foreground hover:bg-secondary/80 active:scale-95 disabled:opacity-40 disabled:pointer-events-none transition-all cursor-pointer font-bold text-xs"
+                  title="1 second piche se kam karein (-)"
+                  aria-label="Decrease end padding"
+                >
+                  <Minus className="size-3.5" />
+                </button>
+                <span className="w-10 text-center font-mono text-xs font-semibold text-primary">
+                  +{tailPaddingSec}s
+                </span>
+                <button
+                  type="button"
+                  onClick={() => setTailPaddingSec((prev) => Math.min(60, prev + 1))}
+                  disabled={rendering || tailPaddingSec >= 60}
+                  className="flex h-7 w-7 items-center justify-center rounded border border-border bg-secondary text-foreground hover:bg-secondary/80 active:scale-95 disabled:opacity-40 disabled:pointer-events-none transition-all cursor-pointer font-bold text-xs"
+                  title="1 second piche add karein (+)"
+                  aria-label="Increase end padding"
+                >
+                  <Plus className="size-3.5" />
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+
         <div className="mt-3 flex flex-wrap items-center gap-2">
           {!rendering && (
             <button
@@ -341,6 +461,7 @@ export function RenderPanel({ scan }: { scan: Scan }) {
           )}
           <span className="ml-auto font-mono text-[11px] text-muted-foreground">
             {resolution} · {fps}fps · {videoKbps}k video / {audioKbps}k audio
+            {(headPaddingSec > 0 || tailPaddingSec > 0) ? ` · Pad: +${headPaddingSec}s/+${tailPaddingSec}s` : ''}
           </span>
         </div>
 

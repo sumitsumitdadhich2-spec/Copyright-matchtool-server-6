@@ -21,6 +21,7 @@ import { CandidatesPanel } from './candidates-panel'
 import { LogsPanel } from './logs-panel'
 import { ReportPanel } from './report-panel'
 import { ComparePanel } from './compare-panel'
+import { BatchVerifierPanel } from './batch-verifier-panel'
 import { RenderPanel } from './render-panel'
 import { HistoryPanel } from './history-panel'
 import { GapBackupPanel } from './gap-backup-panel'
@@ -313,6 +314,7 @@ export function Dashboard() {
           {scan && scan.report && <ReportPanel scan={scan} />}
           {scan && (scan.status === 'done' || scan.status === 'stopped') && <GapBackupPanel scan={scan} />}
           {scan && (scan.matches?.length ?? 0) > 0 && <ComparePanel scan={scan} />}
+          {scan && (scan.matches?.length ?? 0) > 0 && <BatchVerifierPanel scan={scan} />}
           {scan && (scan.status === 'done' || scan.status === 'stopped') && (scan.matches?.length ?? 0) > 0 && (
             <RenderPanel scan={scan} />
           )}

@@ -122,17 +122,27 @@ export function CandidateChooser({
           <Star className="size-3.5 text-primary" aria-hidden />
           {total} candidate{total === 1 ? '' : 's'} for this clip
         </span>
-        {badge && <span className={`rounded-full px-2 py-0.5 font-mono text-[10px] ${badge.cls}`}>{badge.label}</span>}
+        {viewing && (viewing.viaRescan || viewing.origin === 'rescan') ? (
+          <span className="rounded-full bg-indigo-500/20 text-indigo-400 border border-indigo-500/30 px-2 py-0.5 font-mono text-[10px] font-medium">
+            🔄 Rescanned (User Review)
+          </span>
+        ) : !viewing && mainOpt && (mainOpt.viaRescan || mainOpt.origin === 'rescan') ? (
+          <span className="rounded-full bg-indigo-500/20 text-indigo-400 border border-indigo-500/30 px-2 py-0.5 font-mono text-[10px] font-medium">
+            🔄 Rescanned Main
+          </span>
+        ) : badge ? (
+          <span className={`rounded-full px-2 py-0.5 font-mono text-[10px] ${badge.cls}`}>{badge.label}</span>
+        ) : null}
         {viewing && (
           <span className="font-mono text-[10px] text-muted-foreground">
             movie {fmtTime(viewing.movieStart)}–{fmtTime(viewing.movieEnd)} · chunk {viewing.chunkIndex} · {displayModelName(viewing.model)}
-            {viewing.viaRescan ? ' · rescan' : ''}
+            {viewing.viaRescan || viewing.origin === 'rescan' ? ' · 🔄 rescan' : ''}
           </span>
         )}
         {!viewing && mainOpt && (
           <span className="font-mono text-[10px] text-muted-foreground">
             showing MAIN — movie {fmtTime(mainOpt.movieStart)}–{fmtTime(mainOpt.movieEnd)}
-            {mainOpt.isUserPick ? ' · your choice' : ''}
+            {mainOpt.viaRescan || mainOpt.origin === 'rescan' ? ' · 🔄 rescan' : mainOpt.isUserPick ? ' · your choice' : ''}
           </span>
         )}
         <span className="ml-auto font-mono text-[10px] text-muted-foreground">

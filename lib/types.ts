@@ -34,6 +34,13 @@ export interface ChunkMatch {
   origin?: MatchOrigin
   /** gap-backup only: 20-min movie window (#index) that found this part */
   originWindow?: number
+  /** BATCH MINUTE VERIFIER: result of multi-scene stitched verification at 24 fps */
+  batchVerified?: 'confirmed' | 'rejected' | 'pending'
+  batchVerdict?: 'CONFIRMED' | 'REJECTED'
+  batchReason?: string
+  batchModel?: string
+  batchTimestamp?: number
+  rescanRequired?: boolean
 }
 
 /** Full raw model output captured for a chunk request (for the UI expander). */
@@ -122,6 +129,10 @@ export interface RenderSettings {
   videoBitrateKbps: number
   /** audio bitrate in kbps */
   audioBitrateKbps: number
+  /** optional head/start padding in seconds (expands movie clip earlier) */
+  headPaddingSec?: number
+  /** optional tail/end padding in seconds (expands movie clip later) */
+  tailPaddingSec?: number
 }
 
 export type RenderStatus = 'idle' | 'rendering' | 'done' | 'error'
@@ -217,6 +228,54 @@ export interface MissingSceneScanState {
   error?: string | null
   startedAt?: number | null
   finishedAt?: number | null
+}
+
+// ---------- Batch Minute Verifier System (All-in-One 24fps) ----------
+
+export interface BatchVerifyPart {
+  partIndex: number
+  /** Index of the corresponding ChunkMatch in scan.matches */
+  matchIndex?: number
+  /** ABSOLUTE seconds in original short video */
+  shortStart: number
+  shortEnd: number
+  /** ABSOLUTE seconds in original movie video */
+  movieStart: number
+  movieEnd: number
+  /** Offset within the concatenated 24fps verification clip */
+  localStart: number
+  localEnd: number
+  duration: number
+  verdict?: 'CONFIRMED' | 'REJECTED' | 'PENDING'
+  confidence?: number
+  dialogueQuote?: string
+  reason?: string
+  rescanRequired?: boolean
+}
+
+export interface BatchMinuteResult {
+  minuteIndex: number // 0-based: 0 = 0-60s, 1 = 60-120s, etc.
+  shortStart: number
+  shortEnd: number
+  status: 'idle' | 'preparing' | 'verifying' | 'done' | 'error'
+  model?: string
+  error?: string
+  totalScenes: number
+  confirmedCount: number
+  rejectedCount: number
+  parts: BatchVerifyPart[]
+  startedAt?: number
+  finishedAt?: number
+  updatedAt: number
+}
+
+export interface BatchVerifyState {
+  status: 'idle' | 'running' | 'done' | 'stopped' | 'error'
+  progress?: string
+  startedAt?: number | null
+  finishedAt?: number | null
+  activeMinutes?: number[]
+  results: Record<number, BatchMinuteResult>
 }
 
 // ---------- Candidate + Verifier system ----------
@@ -714,6 +773,8 @@ export interface Scan {
   gapBackup?: GapBackupState
   /** MISSING SCENE SCANNER: user-triggered targeted search for selected missing short scenes */
   missingSceneScan?: MissingSceneScanState
+  /** BATCH MINUTE VERIFIER: all-in-one 24fps stitched verification across minutes */
+  batchVerify?: BatchVerifyState
   logs: LogEntry[]
   startedAt: number | null
   finishedAt: number | null

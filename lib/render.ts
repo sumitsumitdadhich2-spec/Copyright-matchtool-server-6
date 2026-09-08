@@ -56,9 +56,21 @@ export function validateRenderSettings(input: unknown): { ok: true; settings: Re
   if (!Number.isFinite(ab) || ab < 32 || ab > 320) {
     return { ok: false, error: 'Audio bitrate must be between 32 and 320 kbps' }
   }
+  const headPad = Number(s.headPaddingSec)
+  const headPaddingSec = Number.isFinite(headPad) && headPad > 0 ? Math.min(60, Math.round(headPad)) : 0
+  const tailPad = Number(s.tailPaddingSec)
+  const tailPaddingSec = Number.isFinite(tailPad) && tailPad > 0 ? Math.min(60, Math.round(tailPad)) : 0
+
   return {
     ok: true,
-    settings: { resolution: s.resolution, fps, videoBitrateKbps: Math.round(vb), audioBitrateKbps: Math.round(ab) },
+    settings: {
+      resolution: s.resolution,
+      fps,
+      videoBitrateKbps: Math.round(vb),
+      audioBitrateKbps: Math.round(ab),
+      headPaddingSec,
+      tailPaddingSec,
+    },
   }
 }
 
@@ -154,9 +166,24 @@ export async function startRender(scanId: string, settings: RenderSettings): Pro
     saveScan(scan, { immediate: true })
   }
 
+  const rawSegments = buildRenderSegments(scan)
+  const headPad = Math.max(0, settings.headPaddingSec || 0)
+  const tailPad = Math.max(0, settings.tailPaddingSec || 0)
+  const maxMovieDur = scan.movieDuration && scan.movieDuration > 0 ? scan.movieDuration : Infinity
+
+  const effectiveSegments = rawSegments.map((seg) => {
+    const paddedMovieStart = Math.max(0, seg.movieStart - headPad)
+    const paddedMovieEnd = Math.min(maxMovieDur, Math.max(paddedMovieStart + 0.05, seg.movieEnd + tailPad))
+    return {
+      ...seg,
+      movieStart: paddedMovieStart,
+      movieEnd: paddedMovieEnd,
+    }
+  })
+
   // FRAME GRID: scenes are snapped to the output fps before anything is
   // encoded, so the expected total is an exact frame count (see render-segments).
-  const segments = snapSegments(buildRenderSegments(scan), settings.fps)
+  const segments = snapSegments(effectiveSegments, settings.fps)
   if (segments.length === 0) return 'No matched scenes to render'
 
   const mediaDir = scanMediaDir(scanId)
@@ -186,7 +213,7 @@ export async function startRender(scanId: string, settings: RenderSettings): Pro
   addLog(
     scan,
     'info',
-    `Render started: ${segments.length} scenes, ${totalOut.toFixed(3)}s output (${segments.reduce((n, s) => n + s.frames, 0)} frames @ ${settings.fps}fps), ${settings.resolution}, ${settings.videoBitrateKbps}kbps video / ${settings.audioBitrateKbps}kbps audio — ${Math.min(engines, segments.length)} part(s) at a time on ${engines} engines, precise re-encode (no stream copy)${scan.status === 'stopped' ? ' — PARTIAL export (scan stopped; ab tak ke matches)' : ''}`,
+    `Render started: ${segments.length} scenes, ${totalOut.toFixed(3)}s output (${segments.reduce((n, s) => n + s.frames, 0)} frames @ ${settings.fps}fps), ${settings.resolution}, ${settings.videoBitrateKbps}kbps video / ${settings.audioBitrateKbps}kbps audio${headPad > 0 || tailPad > 0 ? ` [Padding: head +${headPad}s, tail +${tailPad}s per clip]` : ''} — ${Math.min(engines, segments.length)} part(s) at a time on ${engines} engines, precise re-encode (no stream copy)${scan.status === 'stopped' ? ' — PARTIAL export (scan stopped; ab tak ke matches)' : ''}`,
   )
   // COVERAGE of what is ACTUALLY being rendered (not just what the scan matched):
   // overlap trimming and duplicate skipping happen in buildRenderSegments, so
