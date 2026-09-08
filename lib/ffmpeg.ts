@@ -47,7 +47,7 @@ const OUT_FLAGS = ['-avoid_negative_ts', 'make_zero', '-fps_mode', 'cfr', '-pix_
 /** Final joins obey the same one-thread-per-engine contract as every other
  * pooled process. Their filters already reset both streams to timestamp zero;
  * avoid_negative_ts would shift an H.264 MP4 forward by two frames. */
-const JOIN_OUT_FLAGS = ['-fps_mode', 'cfr', '-pix_fmt', 'yuv420p', '-threads', '1']
+const JOIN_OUT_FLAGS = ['-fps_mode', 'cfr', '-pix_fmt', 'yuv420p', '-threads', '0']
 /** Lossless audio for intermediate parts (no priming/padding — see header). */
 const PART_AUDIO = ['-c:a', 'pcm_s16le', '-ar', '48000']
 /** Container for intermediate parts: QuickTime carries PCM without `-strict` flags. */

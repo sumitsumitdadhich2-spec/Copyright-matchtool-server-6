@@ -266,7 +266,7 @@ function partArgs(movieFile: string, hasAudio: boolean, seg: SnappedSegment, w: 
     `[0:v]${scalePadFilter(w, h, fps)},trim=end_frame=${seg.frames},setpts=PTS-STARTPTS[v];${hasAudio ? '[0:a]' : '[1:a]'}aresample=48000:async=0:first_pts=0,aformat=channel_layouts=stereo,apad=whole_len=${Math.round(snapDur * 48000)},atrim=end_sample=${Math.round(snapDur * 48000)},asetpts=N/SR/TB[a]`,
     '-map', '[v]', '-map', '[a]',
     '-frames:v', String(seg.frames), '-r', String(fps),
-    '-c:v', 'libx264', '-preset', 'medium', '-crf', '18', '-bf', '0',
+    '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '18', '-bf', '0',
     // Lossless PCM audio in parts: AAC priming/padding per part stacked up to
     // +2.3 s over 48 scenes (audio ran long, seams shifted, A/V drifted).
     ...PART_AUDIO, '-ac', '2',
@@ -366,7 +366,7 @@ async function runRenderPipeline(
         height: h,
         fps: settings.fps,
         channels: 2,
-        preset: 'medium',
+        preset: 'fast',
         final: { videoKbps: settings.videoBitrateKbps, audioKbps: settings.audioBitrateKbps },
         token,
         label: `render ${scanId.slice(0, 6)}`,

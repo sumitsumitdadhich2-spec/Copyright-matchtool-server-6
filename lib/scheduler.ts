@@ -1768,9 +1768,6 @@ class Scheduler {
     // Small segments are cut WITH padding; the padding note tells the model where the target is.
     const shortClipFile = path.join(clipsDir, `${g.id}-short.mp4`)
     await extractClipPrecise(path.join(mediaDir, 'short.mp4'), g.shortStart - padBefore, g.shortEnd + padAfter, shortClipFile)
-    if (needsPad) {
-      addLog(scan, 'info', `Padding: short segment ${ts(g.shortStart)}–${ts(g.shortEnd)} is only ${segDur.toFixed(3)}s — clips padded (+${padBefore.toFixed(3)}s / +${padAfter.toFixed(3)}s), target window written into the prompt`)
-    }
     const shortClip = await uploadVideo(lane.ai, shortClipFile)
     const uploadedNames: string[] = [shortClip.name]
 
