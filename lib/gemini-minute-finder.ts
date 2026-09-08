@@ -449,46 +449,6 @@ async function run(id: string, ctrl: Ctrl, apiKeys: string[], user: FinderUser):
   if (ctrl.stopping) return
   const copyDuration = ctrl.state.movieCopy!.durationSec
 
-  // ---- [2] Uploads: short + movie copy, ONCE PER API KEY (parallel) ----
-  // A key whose upload fails (bad key, storage quota, network) is DROPPED from
-  // the lane set instead of killing the whole run — the other keys carry on.
-  const allKeys = apiKeys.map((k, i) => ({ keyIdx: i + 1, apiKey: k, keyId: apiKeyHash(k), ai: getClient(k) }))
-  persist(id, ctrl, { status: 'uploading', progress: `Uploading to Gemini (0/${allKeys.length} keys)...` })
-  let uploadedKeys = 0
-  const uploadResults: boolean[] = new Array(allKeys.length).fill(false)
-  const UPLOAD_CONCURRENCY = 2
-  let keyCursor = 0
-  const workers = Array.from({ length: Math.min(UPLOAD_CONCURRENCY, allKeys.length) }, async () => {
-    while (keyCursor < allKeys.length) {
-      if (ctrl.stopping) return
-      const i = keyCursor++
-      const k = allKeys[i]
-      try {
-        await ensureUploads(id, ctrl, k.keyId, k.keyIdx, k.ai, shortFile, copyPath)
-        uploadedKeys += 1
-        uploadResults[i] = true
-        persist(id, ctrl, { progress: `Uploading to Gemini (${uploadedKeys}/${allKeys.length} keys)...` })
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err)
-        log(id, 'error', `Key ${k.keyIdx}: upload failed — is key ko skip kar rahe hain: ${msg.slice(0, 160)}`)
-        uploadResults[i] = false
-      }
-    }
-  })
-  await Promise.all(workers)
-  if (ctrl.stopping) return
-  const lanesByKey = allKeys.filter((_, i) => uploadResults[i])
-  if (lanesByKey.length === 0) {
-    throw new Error('Kisi bhi API key par upload nahi hua (short + movie copy) — key/quota check karke Retry karo.')
-  }
-  log(
-    id,
-    'success',
-    `Uploads ready on ${lanesByKey.length}/${allKeys.length} key(s) (short + movie copy, Files API)${
-      lanesByKey.length < allKeys.length ? ` — ${allKeys.length - lanesByKey.length} key(s) skipped` : ''
-    }`,
-  )
-
   // ---- Windows: fixed 20-minute slices of the movie copy ----
   if (ctrl.state.windows.length === 0) {
     const windows: GeminiPrescanWindow[] = []
@@ -500,6 +460,58 @@ async function run(id: string, ctrl: Ctrl, apiKeys: string[], user: FinderUser):
   ctrl.queue = ctrl.state.windows.filter((w) => w.status === 'pending').map((w) => w.index)
   const total = ctrl.state.windows.length
   const pending = ctrl.queue.length
+
+  // ---- [2] Uploads: short + movie copy ----
+  // We only need enough keys to provide lanes for the windows (each key has 3 model lanes).
+  // E.g., for 5 windows, 2 keys (6 lanes) are sufficient to scan all windows in parallel.
+  // We prioritize keys with existing cached uploads first so upload time is 0s whenever possible.
+  const allKeys = apiKeys.map((k, i) => ({ keyIdx: i + 1, apiKey: k, keyId: apiKeyHash(k), ai: getClient(k) }))
+  const maxKeysForPrescan = Math.min(allKeys.length, Math.max(2, Math.min(3, Math.ceil(total / 2))))
+
+  // Sort keys: cached active uploads first, then remaining keys
+  const sortedKeys = [...allKeys].sort((a, b) => {
+    const aCached = ctrl.state.uploads[a.keyId] ? 1 : 0
+    const bCached = ctrl.state.uploads[b.keyId] ? 1 : 0
+    return bCached - aCached
+  })
+  const selectedKeys = sortedKeys.slice(0, maxKeysForPrescan)
+
+  persist(id, ctrl, { status: 'uploading', progress: `Uploading to Gemini (0/${selectedKeys.length} keys)...` })
+  let uploadedKeys = 0
+  const uploadResults: boolean[] = new Array(selectedKeys.length).fill(false)
+  const UPLOAD_CONCURRENCY = 2
+  let keyCursor = 0
+  const workers = Array.from({ length: Math.min(UPLOAD_CONCURRENCY, selectedKeys.length) }, async () => {
+    while (keyCursor < selectedKeys.length) {
+      if (ctrl.stopping) return
+      const i = keyCursor++
+      const k = selectedKeys[i]
+      try {
+        await ensureUploads(id, ctrl, k.keyId, k.keyIdx, k.ai, shortFile, copyPath)
+        uploadedKeys += 1
+        uploadResults[i] = true
+        persist(id, ctrl, { progress: `Uploading to Gemini (${uploadedKeys}/${selectedKeys.length} keys)...` })
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err)
+        log(id, 'error', `Key ${k.keyIdx}: upload failed — is key ko skip kar rahe hain: ${msg.slice(0, 160)}`)
+        uploadResults[i] = false
+      }
+    }
+  })
+  await Promise.all(workers)
+  if (ctrl.stopping) return
+  const lanesByKey = selectedKeys.filter((_, i) => uploadResults[i])
+  if (lanesByKey.length === 0) {
+    throw new Error('Kisi bhi API key par upload nahi hua (short + movie copy) — key/quota check karke Retry karo.')
+  }
+  log(
+    id,
+    'success',
+    `Uploads ready on ${lanesByKey.length}/${selectedKeys.length} key(s) (short + movie copy, Files API)${
+      lanesByKey.length < selectedKeys.length ? ` — ${selectedKeys.length - lanesByKey.length} key(s) skipped` : ''
+    }`,
+  )
+
   persist(id, ctrl, { status: 'scanning', progress: `Scanning windows (${total - pending}/${total})` })
   log(
     id,
