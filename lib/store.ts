@@ -174,6 +174,16 @@ export function setModelExhausted(model: string, apiKey: string, rpd: number) {
   writeJSON(COUNTERS_FILE, counters)
 }
 
+export function resetAllDailyCounters(): void {
+  ensureDirs()
+  const today = todayKey()
+  const newCounters: CountersData = {
+    _lastActiveDay: today,
+    _lastResetTime: Date.now(),
+  }
+  writeJSON(COUNTERS_FILE, newCounters)
+}
+
 export function getAllUsage(apiKey: string): Record<string, number> {
   checkDailyReset()
   const out: Record<string, number> = {}

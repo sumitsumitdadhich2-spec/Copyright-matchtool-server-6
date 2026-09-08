@@ -49,15 +49,18 @@ export function extractResponseText(resp: GeminiResponseLike | unknown): string 
     return r.text.trim()
   }
   if (Array.isArray(r?.candidates)) {
+    const allText: string[] = []
     for (const candidate of r.candidates) {
       if (candidate?.content?.parts && Array.isArray(candidate.content.parts)) {
-        const textParts = candidate.content.parts
-          .map((p) => p?.text)
-          .filter((t): t is string => typeof t === 'string' && t.trim().length > 0)
-        if (textParts.length > 0) {
-          return textParts.join('\n').trim()
+        for (const p of candidate.content.parts) {
+          if (typeof p?.text === 'string' && p.text.trim().length > 0) {
+            allText.push(p.text.trim())
+          }
         }
       }
+    }
+    if (allText.length > 0) {
+      return allText.join('\n').trim()
     }
   }
   return ''
@@ -142,37 +145,52 @@ export function classifyError(err: unknown): GeminiError {
   ) {
     return new GeminiError('unavailable', msg)
   }
+  // Server busy or temporary unavailable (503 / 500 / high demand / overloaded)
+  if (
+    lower.includes('503') ||
+    lower.includes('500') ||
+    lower.includes('high demand') ||
+    lower.includes('service unavailable') ||
+    lower.includes('temporarily unavailable') ||
+    lower.includes('overloaded') ||
+    lower.includes('fetch failed')
+  ) {
+    return new GeminiError('rate', msg)
+  }
+
+  // Check if it's explicitly a DAILY quota exhaustion (RPD).
+  // Google Gemini API specifically names daily quotas as:
+  // "GenerateRequestsPerDay" or "requests per day" or "quota metric '...requests per day'" or "generaterequestsperday"
+  // or "per day" / "perday" / "daily requests".
+  const isExplicitDaily =
+    lower.includes('generaterequestsperday') ||
+    lower.includes('generatetokensperday') ||
+    lower.includes('requests per day') ||
+    lower.includes('request sper day') ||
+    lower.includes('per day') ||
+    lower.includes('perday') ||
+    lower.includes('daily requests') ||
+    (lower.includes('daily') && lower.includes('quota')) ||
+    (lower.includes('limit: 20') && lower.includes('daily'))
+
+  if (isExplicitDaily) {
+    return new GeminiError('rpd', msg)
+  }
+
+  // All other 429s, resource_exhausted, quota exceeded, per-minute, TPM, RPM, pacing are TEMPORARY rate limits
   const is429 =
     lower.includes('429') ||
     lower.includes('resource_exhausted') ||
+    lower.includes('resource has been exhausted') ||
     lower.includes('quota') ||
     lower.includes('rate limit') ||
     lower.includes('limit:') ||
-    lower.includes('exhausted')
+    lower.includes('exhausted') ||
+    lower.includes('per minute') ||
+    lower.includes('rpm') ||
+    lower.includes('tpm')
 
   if (is429) {
-    // Check if it's explicitly a short per-minute RPM rate limit with no quota/limit: 20 indication
-    const isRpm =
-      (lower.includes('per minute') || lower.includes('requests per minute') || lower.includes('rpm')) &&
-      !lower.includes('limit: 20') &&
-      !lower.includes('free_tier') &&
-      !lower.includes('daily')
-
-    if (
-      !isRpm ||
-      lower.includes('limit: 20') ||
-      lower.includes('free_tier') ||
-      lower.includes('per day') ||
-      lower.includes('perday') ||
-      lower.includes('daily') ||
-      lower.includes('requests per day') ||
-      lower.includes('generaterequestsperday') ||
-      lower.includes('resource_exhausted') ||
-      lower.includes('resource has been exhausted') ||
-      lower.includes('quota exceeded')
-    ) {
-      return new GeminiError('rpd', msg)
-    }
     return new GeminiError('rate', msg)
   }
 

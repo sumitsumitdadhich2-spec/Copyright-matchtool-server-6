@@ -924,8 +924,8 @@ async function laneWorker(id: string, ctrl: Ctrl, lane: Lane, env: LaneEnv, pass
       } else {
         w.status = 'pending'
         w.error = e.message.slice(0, 200)
-        // Put it at the FRONT so a different lane picks it up next.
-        queue.unshift(idx)
+        // Move to the back of the queue so other available keys/lanes get a turn.
+        queue.push(idx)
         log(id, 'warn', `${tag} #${w.index} attempt ${w.attempts} failed on ${lane.label} — re-queued: ${e.message.slice(0, 120)}`)
       }
       persist(id, ctrl)

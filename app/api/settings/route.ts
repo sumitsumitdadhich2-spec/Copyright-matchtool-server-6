@@ -148,6 +148,13 @@ export async function POST(req: Request) {
     return NextResponse.json({ ok: true, deleted: totalDeleted, total: totalChecked })
   }
 
+  // ----- Reset daily quota counters: { resetCounters: true } -----
+  if (body.resetCounters === true) {
+    const { resetAllDailyCounters } = await import('@/lib/store')
+    resetAllDailyCounters()
+    return NextResponse.json({ ok: true, message: 'All daily quota counters have been reset to 0' })
+  }
+
   // ----- Clear a key slot: { clear: n } -----
   if (typeof body.clear === 'number') {
     const n = body.clear
