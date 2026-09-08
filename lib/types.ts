@@ -10,6 +10,8 @@ export type MatchOrigin = 'chunk' | 'rescan' | 'gap-backup' | 'user'
 
 /** One parsed "Short X --> Movie Y" mapping line from the model's HISSA 2 output. */
 export interface ChunkMatch {
+  /** unique stable ID for this match */
+  id?: string
   /** seconds within the short video */
   shortStart: number
   shortEnd: number
@@ -234,6 +236,10 @@ export interface MissingSceneScanState {
 
 export interface BatchVerifyPart {
   partIndex: number
+  /** Unique stable ID of the ChunkMatch */
+  matchId?: string
+  /** Chunk index of the matched movie chunk */
+  chunkIndex?: number
   /** Index of the corresponding ChunkMatch in scan.matches */
   matchIndex?: number
   /** ABSOLUTE seconds in original short video */
@@ -249,6 +255,7 @@ export interface BatchVerifyPart {
   verdict?: 'CONFIRMED' | 'REJECTED' | 'PENDING'
   confidence?: number
   dialogueQuote?: string
+  visualAnchorProof?: string
   reason?: string
   rescanRequired?: boolean
 }

@@ -9,7 +9,7 @@ import { originLabel, isRejectedKept } from '@/lib/candidate-pick'
 export function ReportPanel({ scan }: { scan: Scan }) {
   const report = scan.report
   if (!report) return null
-  const matches = report.matches || []
+  const matches = (scan.matches && scan.matches.length > 0) ? scan.matches : (report.matches || [])
   const chunksPending = report.chunksPending ?? 0
   // Older saved reports have no groupsPending — derive the gap so totals still add up.
   const groupsPending =
@@ -112,8 +112,12 @@ export function ReportPanel({ scan }: { scan: Scan }) {
                       <span className={isRejectedKept(m) ? 'text-destructive' : 'text-muted-foreground'}>{isRejectedKept(m) ? 'rejected kept' : originLabel(m.origin, m.originWindow)}</span>
                     </td>
                     <td className="py-1">
-                      {m.verified ? (
-                        <span className="text-success">{m.viaRescan ? 'yes (rescan)' : 'yes'}</span>
+                      {m.verified || m.batchVerified === 'confirmed' ? (
+                        <span className="text-success font-medium">
+                          {m.batchVerified === 'confirmed' ? 'yes (batch 24fps)' : m.viaRescan ? 'yes (rescan)' : 'yes'}
+                        </span>
+                      ) : m.batchVerified === 'rejected' ? (
+                        <span className="text-destructive font-medium">no (rejected)</span>
                       ) : (
                         <span className="text-warning">no</span>
                       )}

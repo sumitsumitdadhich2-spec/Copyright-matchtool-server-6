@@ -37,7 +37,28 @@ import { CandidateChooser } from './candidate-chooser'
  *  branding for user review. */
 export function ComparePanel({ scan }: { scan: Scan }) {
   const { mutate } = useSWRConfig()
-  const pairs = scan.matches || []
+  const pairs = useMemo(() => {
+    const raw = scan.matches || []
+    // Filter / deduplicate so that if a confirmed / verified match exists for a short window,
+    // competing unverified duplicate candidates for that same window do not appear as separate entries.
+    // They remain cleanly accessible through the Candidate Chooser below.
+    const out: ChunkMatch[] = []
+    for (const m of raw) {
+      const hasBetterConfirmed = out.some(
+        (existing) =>
+          (existing.verified || existing.userPick || existing.batchVerified === 'confirmed') &&
+          !m.verified &&
+          !m.userPick &&
+          m.batchVerified !== 'confirmed' &&
+          (Math.abs(existing.shortStart - m.shortStart) < 0.35 ||
+            Math.max(0, Math.min(existing.shortEnd, m.shortEnd) - Math.max(existing.shortStart, m.shortStart)) > 0.15),
+      )
+      if (!hasBetterConfirmed) {
+        out.push(m)
+      }
+    }
+    return out
+  }, [scan.matches])
   const [idx, setIdx] = useState(0)
   const [playing, setPlaying] = useState(false)
   // null = the pair's own movie window; a number = options[candIdx] on the movie side
@@ -359,6 +380,11 @@ export function ComparePanel({ scan }: { scan: Scan }) {
           <span className="flex items-center gap-1 rounded-full border border-rose-500/40 bg-rose-500/15 px-2.5 py-0.5 font-mono text-xs font-semibold text-rose-400" title={pair.batchReason}>
             <AlertCircle className="size-3" aria-hidden />
             Batch Verifier: REJECTED (Rescan Required)
+          </span>
+        )}
+        {!pair.verified && !pair.batchVerified && !pair.userPick && (
+          <span className="rounded-full border border-amber-500/40 bg-amber-500/15 px-2.5 py-0.5 font-mono text-xs font-medium text-amber-400">
+            Unconfirmed (Pending 24fps)
           </span>
         )}
 

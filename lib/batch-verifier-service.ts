@@ -64,14 +64,27 @@ export function parseBatchVerifierResponse(
         const idx = Number(item.partIndex || item.part || item.index)
         if (partsMap.has(idx)) {
           const rawVerdict = String(item.verdict || '').toUpperCase()
-          const isConfirmed = rawVerdict.includes('CONFIRM') || rawVerdict.includes('SAME') || rawVerdict.includes('MATCH')
+          const confidence = typeof item.confidence === 'number' ? item.confidence : 0.9
+          // Strict confidence threshold: if confidence is low (< 0.75), treat as REJECTED to prevent false confirms
+          const isConfirmed =
+            (rawVerdict.includes('CONFIRM') || rawVerdict.includes('SAME') || rawVerdict.includes('MATCH')) &&
+            confidence >= 0.75
+
+          const cropDetail = item.cropPosition ? ` [Crop: ${String(item.cropPosition).trim()}]` : ''
+          const anchorProof = item.visualAnchorProof ? ` [Anchor: ${String(item.visualAnchorProof).trim()}]` : ''
+          const baseReason = item.reason
+            ? String(item.reason).trim()
+            : isConfirmed
+              ? 'Forensic scene analysis confirmed same take and action'
+              : 'Scene or action mismatch detected'
+
           const existing = partsMap.get(idx)!
           partsMap.set(idx, {
             ...existing,
             verdict: isConfirmed ? 'CONFIRMED' : 'REJECTED',
-            confidence: typeof item.confidence === 'number' ? item.confidence : isConfirmed ? 0.95 : 0.1,
-            dialogueQuote: item.dialogueQuote ? String(item.dialogueQuote).trim() : undefined,
-            reason: item.reason ? String(item.reason).trim() : isConfirmed ? 'Forensic scene analysis confirmed same take and action' : 'Scene or action mismatch detected',
+            confidence,
+            visualAnchorProof: item.visualAnchorProof ? String(item.visualAnchorProof).trim() : undefined,
+            reason: `${baseReason}${cropDetail}${anchorProof}`,
             rescanRequired: !isConfirmed,
           })
         }
@@ -305,19 +318,56 @@ export async function verifySingleMinute(
     minuteResult.updatedAt = Date.now()
     freshState.results[minuteIndex] = minuteResult
 
-    // Apply verdicts to freshScan.matches
+    // Apply verdicts to freshScan.matches with resilient, coordinate-based matching
     for (const p of verifiedParts) {
       const isConfirmed = p.verdict === 'CONFIRMED'
-      let match = (p.matchIndex !== undefined && freshScan.matches[p.matchIndex])
-        ? freshScan.matches[p.matchIndex]
-        : null
+      let match: ChunkMatch | null = null
 
+      // 1. Precise lookup by unique matchId
+      if (p.matchId) {
+        match = freshScan.matches.find((m) => m.id === p.matchId) || null
+      }
+
+      // 2. Precise lookup by shortStart & movieStart coordinates (ground truth of stitched scene)
       if (!match) {
         match = freshScan.matches.find(
           (m) =>
-            (Math.abs(m.shortStart - p.shortStart) < 0.25 && Math.abs(m.shortEnd - p.shortEnd) < 0.25) ||
-            Math.max(0, Math.min(m.shortEnd, p.shortEnd) - Math.max(m.shortStart, p.shortStart)) > 0.1,
+            Math.abs(m.shortStart - p.shortStart) < 0.25 &&
+            Math.abs(m.movieStart - p.movieStart) < 0.5,
         ) || null
+      }
+
+      // 3. Lookup by chunkIndex and shortStart
+      if (!match && p.chunkIndex !== undefined) {
+        match = freshScan.matches.find(
+          (m) =>
+            m.chunkIndex === p.chunkIndex &&
+            Math.abs(m.shortStart - p.shortStart) < 0.35,
+        ) || null
+      }
+
+      // 4. Fallback to short window overlap minimizing movieStart distance
+      if (!match) {
+        const candidates = freshScan.matches.filter(
+          (m) =>
+            (Math.abs(m.shortStart - p.shortStart) < 0.35 && Math.abs(m.shortEnd - p.shortEnd) < 0.35) ||
+            Math.max(0, Math.min(m.shortEnd, p.shortEnd) - Math.max(m.shortStart, p.shortStart)) > 0.1,
+        )
+        if (candidates.length > 0) {
+          candidates.sort(
+            (a, b) =>
+              Math.abs(a.movieStart - p.movieStart) - Math.abs(b.movieStart - p.movieStart),
+          )
+          match = candidates[0]
+        }
+      }
+
+      // 5. Array index fallback ONLY if coordinates actually match
+      if (!match && p.matchIndex !== undefined && freshScan.matches[p.matchIndex]) {
+        const candidate = freshScan.matches[p.matchIndex]
+        if (Math.abs(candidate.shortStart - p.shortStart) < 0.35) {
+          match = candidate
+        }
       }
 
       if (match) {
@@ -330,6 +380,19 @@ export async function verifySingleMinute(
         if (isConfirmed) {
           match.verified = true
           match.rejected = false
+
+          // Remove any unconfirmed duplicate competing candidates for this same short segment
+          // from scan.matches so they never pollute side-by-side or corrupt merge preview
+          freshScan.matches = freshScan.matches.filter((m) => {
+            if (m === match) return true
+            const isDup =
+              !m.userPick &&
+              !m.verified &&
+              m.batchVerified !== 'confirmed' &&
+              (Math.abs(m.shortStart - match!.shortStart) < 0.35 ||
+                Math.max(0, Math.min(m.shortEnd, match!.shortEnd) - Math.max(m.shortStart, match!.shortStart)) > 0.15)
+            return !isDup
+          })
         } else {
           match.verified = false
           match.rejected = true
@@ -346,11 +409,24 @@ export async function verifySingleMinute(
         if (group) {
           if (isConfirmed) {
             group.status = 'confirmed'
+            const candIdx = group.candidates.findIndex(
+              (c) => Math.abs(c.movieStart - p.movieStart) < 0.5,
+            )
+            if (candIdx >= 0) {
+              group.confirmedIndex = candIdx
+              group.candidates[candIdx].verdict = 'same'
+            }
           } else {
             group.status = 'rejected'
           }
         }
       }
+    }
+
+    // Keep matches sorted cleanly by short timeline and sync with report
+    freshScan.matches.sort((a, b) => a.shortStart - b.shortStart || a.movieStart - b.movieStart)
+    if (freshScan.report) {
+      freshScan.report.matches = [...freshScan.matches]
     }
 
     saveScan(freshScan)

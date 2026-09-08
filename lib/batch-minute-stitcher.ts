@@ -20,10 +20,26 @@ export function planMinuteSegments(scan: Scan, minuteIndex: number): MinuteSegme
   const minStart = minuteIndex * 60
   const minEnd = (minuteIndex + 1) * 60
 
-  // All matches that overlap this minute
+  // Ensure all matches have stable IDs for resilient lookup
+  for (let i = 0; i < (scan.matches || []).length; i++) {
+    const m = scan.matches[i]
+    if (!m.id) {
+      m.id = `m_${i}_${m.shortStart.toFixed(3)}_${m.movieStart.toFixed(3)}_${m.chunkIndex}`
+    }
+  }
+
+  // All matches that overlap this minute, prioritizing user picks and verified scenes
   const candidateMatches: ChunkMatch[] = (scan.matches || [])
     .filter((m) => m.shortStart < minEnd && m.shortEnd > minStart)
-    .sort((a, b) => a.shortStart - b.shortStart)
+    .sort(
+      (a, b) =>
+        a.shortStart - b.shortStart ||
+        Number(b.userPick === true) - Number(a.userPick === true) ||
+        Number(b.verified === true || b.batchVerified === 'confirmed') -
+          Number(a.verified === true || a.batchVerified === 'confirmed') ||
+        (b.confidence || 0) - (a.confidence || 0) ||
+        a.movieStart - b.movieStart,
+    )
 
   const parts: BatchVerifyPart[] = []
   let runningLocalClock = 0
@@ -53,6 +69,8 @@ export function planMinuteSegments(scan: Scan, minuteIndex: number): MinuteSegme
 
     parts.push({
       partIndex,
+      matchId: m.id,
+      chunkIndex: m.chunkIndex,
       matchIndex: scan.matches.indexOf(m),
       shortStart: adjustedStart,
       shortEnd: sEnd,

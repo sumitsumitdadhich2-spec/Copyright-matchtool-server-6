@@ -49,7 +49,10 @@ export function stopMissingSceneScanner(scanId: string): { ok: boolean; error?: 
 export function getDetectedMissingScenes(scan: Scan): MissingSceneTarget[] {
   const shortDur = scan.shortDuration || 0
   if (shortDur <= 0) return []
-  const matches = (scan.matches || []).map((m) => ({ start: m.shortStart, end: m.shortEnd }))
+  // Matches that genuinely cover the short video (excluding rejected ones)
+  const matches = (scan.matches || [])
+    .filter((m) => !m.rejected && m.batchVerified !== 'rejected')
+    .map((m) => ({ start: m.shortStart, end: m.shortEnd }))
   const covered = mergeRanges(matches)
   const gaps = gapsOf(covered, shortDur).filter((g) => g.end - g.start >= 0.4)
   return gaps.map((g, idx) => ({

@@ -31,7 +31,10 @@ export function buildRenderSegments(scan: Pick<Scan, 'matches'>): RenderSegment[
     .sort(
       (a, b) =>
         a.shortStart - b.shortStart ||
-        Number(b.verified === true) - Number(a.verified === true) ||
+        Number(b.userPick === true) - Number(a.userPick === true) ||
+        Number(b.verified === true || b.batchVerified === 'confirmed') -
+          Number(a.verified === true || a.batchVerified === 'confirmed') ||
+        (b.confidence || 0) - (a.confidence || 0) ||
         a.movieStart - b.movieStart,
     )
 
@@ -41,6 +44,24 @@ export function buildRenderSegments(scan: Pick<Scan, 'matches'>): RenderSegment[
     const { shortEnd, movieEnd } = match
     const previous = segments.at(-1)
 
+    const isUnverifiedCandidate =
+      match.userPick !== true && match.verified !== true && match.batchVerified !== 'confirmed'
+
+    // If this match is an unverified candidate and ANY verified/user-picked segment
+    // already covers this short time window, completely skip this candidate!
+    if (isUnverifiedCandidate) {
+      const alreadyCovered = segments.some(
+        (s) =>
+          !s.unverified &&
+          !s.rejected &&
+          (Math.abs(s.shortStart - shortStart) < 0.25 ||
+            Math.max(0, Math.min(s.shortEnd, shortEnd) - Math.max(s.shortStart, shortStart)) > 0.1),
+      )
+      if (alreadyCovered) {
+        continue
+      }
+    }
+
     if (previous) {
       const overlap = previous.shortEnd - shortStart
       if (overlap > 0.05) {
@@ -49,11 +70,17 @@ export function buildRenderSegments(scan: Pick<Scan, 'matches'>): RenderSegment[
         const shorter = Math.min(prevDuration, currDuration)
         const isSameSegment =
           (shorter > 0 && overlap / shorter >= 0.35) ||
-          overlap >= 0.4 ||
+          overlap >= 0.35 ||
           shortEnd <= previous.shortEnd + 0.05
 
         if (isSameSegment) {
           // Alternative candidate or duplicate for the already placed short segment — skip it.
+          continue
+        }
+
+        // If the previous segment was verified and the current candidate is unverified,
+        // NEVER slice and insert an unverified fragment into a verified scene seam!
+        if (!previous.unverified && !previous.rejected && isUnverifiedCandidate) {
           continue
         }
 
@@ -76,7 +103,7 @@ export function buildRenderSegments(scan: Pick<Scan, 'matches'>): RenderSegment[
     }
 
     // Prevent unverified matches from duplicating an already placed movie scene elsewhere in the timeline
-    if (match.userPick !== true && match.verified !== true) {
+    if (isUnverifiedCandidate) {
       const isDuplicateMovieClip = segments.some(
         (s) =>
           Math.max(0, Math.min(s.movieEnd, movieEnd) - Math.max(s.movieStart, movieStart)) > 0.5 ||
@@ -85,6 +112,7 @@ export function buildRenderSegments(scan: Pick<Scan, 'matches'>): RenderSegment[
       if (isDuplicateMovieClip) continue
     }
 
+    const isConfirmed = match.verified === true || match.batchVerified === 'confirmed'
     segments.push({
       movieStart,
       movieEnd,
@@ -93,7 +121,7 @@ export function buildRenderSegments(scan: Pick<Scan, 'matches'>): RenderSegment[
       origin: match.origin ?? 'chunk',
       originWindow: match.originWindow,
       rejected: match.rejected === true && match.userPick !== true ? true : undefined,
-      unverified: match.verified !== true && match.rejected !== true ? true : undefined,
+      unverified: !isConfirmed && match.rejected !== true ? true : undefined,
     })
   }
   return segments
