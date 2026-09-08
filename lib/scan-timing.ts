@@ -21,13 +21,17 @@ export interface ScanTimingBreakdown {
   hasCompletedTasks: boolean
 }
 
-export function computeScanTiming(scan: Scan): ScanTimingBreakdown {
-  const logs = scan.logs || []
+export function computeScanTiming(scan: Scan | null | undefined): ScanTimingBreakdown {
+  if (!scan) {
+    return { tasks: [], totalMs: 0, totalFormatted: '0s', hasCompletedTasks: false }
+  }
+
+  const logs = Array.isArray(scan.logs) ? scan.logs : []
 
   // 1. Chunk Slicing / Video Preparation Time
   let chunkPrepStart: number | null = scan.createdAt || null
   let chunkPrepEnd: number | null = null
-  const prepDoneLog = logs.find((l) => l.msg.includes('Chunks prepared') || l.msg.includes('Chunking complete'))
+  const prepDoneLog = logs.find((l) => l?.msg && (l.msg.includes('Chunks prepared') || l.msg.includes('Chunking complete')))
   if (prepDoneLog) {
     chunkPrepEnd = prepDoneLog.t
   } else if (scan.startedAt && chunkPrepStart) {
@@ -39,11 +43,11 @@ export function computeScanTiming(scan: Scan): ScanTimingBreakdown {
   let prescanStart: number | null = scan.geminiPrescan?.startedAt || null
   let prescanEnd: number | null = scan.geminiPrescan?.finishedAt || null
   if (!prescanStart) {
-    const firstPrescanLog = logs.find((l) => l.msg.includes('[Gemini Prescan]') || l.msg.includes('[Minute Finder]'))
+    const firstPrescanLog = logs.find((l) => l?.msg && (l.msg.includes('[Gemini Prescan]') || l.msg.includes('[Minute Finder]')))
     if (firstPrescanLog) prescanStart = firstPrescanLog.t
   }
   if (!prescanEnd && prescanStart) {
-    const lastPrescanLog = logs.slice().reverse().find((l) => l.msg.includes('Minute finder complete') || l.msg.includes('Prescan done'))
+    const lastPrescanLog = logs.slice().reverse().find((l) => l?.msg && (l.msg.includes('Minute finder complete') || l.msg.includes('Prescan done')))
     if (lastPrescanLog) prescanEnd = lastPrescanLog.t
   }
   let prescanMs = (prescanStart && prescanEnd && prescanEnd >= prescanStart) ? prescanEnd - prescanStart : 0
@@ -52,7 +56,7 @@ export function computeScanTiming(scan: Scan): ScanTimingBreakdown {
   let chunkScanStart: number | null = scan.startedAt || null
   let chunkScanEnd: number | null = scan.finishedAt || null
   if (!chunkScanStart) {
-    const startLog = logs.find((l) => l.msg.includes('Scan started') || l.msg.includes('Scanning minute'))
+    const startLog = logs.find((l) => l?.msg && (l.msg.includes('Scan started') || l.msg.includes('Scanning minute')))
     if (startLog) chunkScanStart = startLog.t
   }
   let chunkScanMs = (scan.report?.totalScanTimeMs && scan.report.totalScanTimeMs > 0)
@@ -63,7 +67,7 @@ export function computeScanTiming(scan: Scan): ScanTimingBreakdown {
 
   // 4. Targeted Scene Rescan Time
   let rescanMs = 0
-  const rescanLogs = logs.filter((l) => l.msg.includes('[Rescan Scene]'))
+  const rescanLogs = logs.filter((l) => l?.msg && l.msg.includes('[Rescan Scene]'))
   if (rescanLogs.length >= 2) {
     const first = rescanLogs[0].t
     const last = rescanLogs[rescanLogs.length - 1].t
@@ -76,11 +80,11 @@ export function computeScanTiming(scan: Scan): ScanTimingBreakdown {
   let verifierStart: number | null = scan.batchVerify?.startedAt || null
   let verifierEnd: number | null = scan.batchVerify?.finishedAt || null
   if (!verifierStart) {
-    const vLog = logs.find((l) => l.msg.includes('[Verifier]') || l.msg.includes('24fps batch verifier'))
+    const vLog = logs.find((l) => l?.msg && (l.msg.includes('[Verifier]') || l.msg.includes('24fps batch verifier')))
     if (vLog) verifierStart = vLog.t
   }
   if (!verifierEnd && verifierStart) {
-    const vDoneLog = logs.slice().reverse().find((l) => l.msg.includes('Batch verification complete') || l.msg.includes('Verifier finished'))
+    const vDoneLog = logs.slice().reverse().find((l) => l?.msg && (l.msg.includes('Batch verification complete') || l.msg.includes('Verifier finished')))
     if (vDoneLog) verifierEnd = vDoneLog.t
   }
   let verifierMs = (verifierStart && verifierEnd && verifierEnd >= verifierStart) ? verifierEnd - verifierStart : 0
@@ -89,11 +93,11 @@ export function computeScanTiming(scan: Scan): ScanTimingBreakdown {
   let missingStart: number | null = scan.gapBackup?.startedAt || scan.missingSceneScan?.startedAt || null
   let missingEnd: number | null = scan.gapBackup?.finishedAt || scan.missingSceneScan?.finishedAt || null
   if (!missingStart) {
-    const mLog = logs.find((l) => l.msg.includes('[Gap Backup]') || l.msg.includes('[Missing Scene]'))
+    const mLog = logs.find((l) => l?.msg && (l.msg.includes('[Gap Backup]') || l.msg.includes('[Missing Scene]')))
     if (mLog) missingStart = mLog.t
   }
   if (!missingEnd && missingStart) {
-    const mDoneLog = logs.slice().reverse().find((l) => l.msg.includes('Gap backup complete') || l.msg.includes('Missing scene scan done'))
+    const mDoneLog = logs.slice().reverse().find((l) => l?.msg && (l.msg.includes('Gap backup complete') || l.msg.includes('Missing scene scan done')))
     if (mDoneLog) missingEnd = mDoneLog.t
   }
   let missingMs = (missingStart && missingEnd && missingEnd >= missingStart) ? missingEnd - missingStart : 0
@@ -102,11 +106,11 @@ export function computeScanTiming(scan: Scan): ScanTimingBreakdown {
   let renderStart: number | null = scan.renderJob?.startedAt || null
   let renderEnd: number | null = scan.renderJob?.finishedAt || null
   if (!renderStart) {
-    const rLog = logs.find((l) => l.msg.includes('[Render]') || l.msg.includes('FFmpeg render started'))
+    const rLog = logs.find((l) => l?.msg && (l.msg.includes('[Render]') || l.msg.includes('FFmpeg render started')))
     if (rLog) renderStart = rLog.t
   }
   if (!renderEnd && renderStart) {
-    const rDoneLog = logs.slice().reverse().find((l) => l.msg.includes('Render complete') || l.msg.includes('Stitching finished'))
+    const rDoneLog = logs.slice().reverse().find((l) => l?.msg && (l.msg.includes('Render complete') || l.msg.includes('Stitching finished')))
     if (rDoneLog) renderEnd = rDoneLog.t
   }
   let renderMs = (renderStart && renderEnd && renderEnd >= renderStart) ? renderEnd - renderStart : 0

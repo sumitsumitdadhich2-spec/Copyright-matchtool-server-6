@@ -217,10 +217,9 @@ export function ComparePanel({ scan }: { scan: Scan }) {
     }
   }, [idx, pairs.length])
 
-  // Leaving a pair always returns to its main window and clears temporary feedback.
+  // Leaving a pair always returns to its main window.
   useEffect(() => {
     setCandIdx(null)
-    setRescanFeedback(null)
   }, [idx, pairShortStart])
 
   // Safe seek helper to prevent video decode lockup during rapid switching
