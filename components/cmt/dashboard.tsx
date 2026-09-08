@@ -25,6 +25,7 @@ import { BatchVerifierPanel } from './batch-verifier-panel'
 import { RenderPanel } from './render-panel'
 import { HistoryPanel } from './history-panel'
 import { GapBackupPanel } from './gap-backup-panel'
+import { LiveActivityBar } from './live-activity-bar'
 
 interface ScanResponse {
   scan: Scan
@@ -292,6 +293,7 @@ export function Dashboard() {
 
       <div className="grid gap-4 lg:grid-cols-3">
         <div className="flex flex-col gap-4 lg:col-span-2">
+          {scan && <LiveActivityBar scan={scan} />}
           {scan && (
             <MinuteFinderPanel
               scan={scan}
