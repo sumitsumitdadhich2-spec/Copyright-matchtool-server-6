@@ -396,43 +396,142 @@ export function findReusableGeminiMovieUpload(
 export const STORAGE_LIMIT_BYTES = DISK_LIMIT_BYTES
 
 let usageCache: { used: number; at: number } | null = null
+let refreshPromise: Promise<number> | null = null
+let cacheGeneration = 0
 
-function dirSize(dir: string, seenInodes = new Set<number>()): number {
-  let total = 0
-  let entries: fs.Dirent[]
-  try {
-    entries = fs.readdirSync(dir, { withFileTypes: true })
-  } catch {
-    return 0
-  }
-  for (const e of entries) {
-    const p = path.join(dir, e.name)
-    try {
-      if (e.isDirectory()) total += dirSize(p, seenInodes)
-      else if (e.isFile()) {
-        const st = fs.statSync(p)
-        if (!seenInodes.has(st.ino)) {
-          seenInodes.add(st.ino)
-          total += st.size
-        }
-      }
-    } catch {
-      // file vanished mid-walk
+const CACHE_TTL_MS = 60_000
+
+function createConcurrencyLimiter(concurrency: number) {
+  let active = 0
+  const queue: Array<() => void> = []
+
+  const dispatch = () => {
+    while (active < concurrency && queue.length > 0) {
+      active++
+      const task = queue.shift()!
+      task()
     }
   }
+
+  return function run<T>(fn: () => Promise<T>): Promise<T> {
+    return new Promise<T>((resolve, reject) => {
+      const task = () => {
+        try {
+          Promise.resolve(fn())
+            .then(resolve, reject)
+            .finally(() => {
+              active--
+              dispatch()
+            })
+        } catch (err) {
+          reject(err)
+          active--
+          dispatch()
+        }
+      }
+      queue.push(task)
+      dispatch()
+    })
+  }
+}
+
+async function dirSize(dir: string): Promise<number> {
+  const seenInodes = new Set<number>()
+  let total = 0
+  const limit = createConcurrencyLimiter(10)
+
+  async function walk(currentDir: string): Promise<void> {
+    let entries: fs.Dirent[]
+    try {
+      entries = await limit(() => fs.promises.readdir(currentDir, { withFileTypes: true }))
+    } catch {
+      return
+    }
+
+    const subTasks: Promise<void>[] = []
+
+    for (const e of entries) {
+      const p = path.join(currentDir, e.name)
+      try {
+        if (e.isDirectory()) {
+          subTasks.push(walk(p))
+        } else if (e.isFile()) {
+          subTasks.push(
+            limit(async () => {
+              try {
+                const st = await fs.promises.stat(p)
+                if (!seenInodes.has(st.ino)) {
+                  seenInodes.add(st.ino)
+                  total += st.size
+                }
+              } catch {
+                // file vanished mid-walk or permission issue
+              }
+            })
+          )
+        }
+      } catch {
+        // ignore entry error
+      }
+    }
+
+    await Promise.all(subTasks)
+  }
+
+  await walk(dir)
   return total
 }
 
-/** Bytes used by all scan media on the local disk. Cached for 30s. */
+function startUsageComputation(): Promise<number> {
+  const currentGen = cacheGeneration
+  const p = (async () => {
+    try {
+      const used = await dirSize(MEDIA_DIR)
+      if (cacheGeneration === currentGen) {
+        usageCache = { used, at: Date.now() }
+      }
+      return used
+    } catch (err) {
+      console.error('[media] storage usage calculation failed:', err)
+      return usageCache?.used ?? 0
+    } finally {
+      if (refreshPromise === p) {
+        refreshPromise = null
+      }
+    }
+  })()
+  refreshPromise = p
+  return p
+}
+
+/** Bytes used by all scan media on the local disk. Non-blocking & cached (stale-while-revalidate). */
 export async function getStorageUsage(): Promise<number> {
-  if (usageCache && Date.now() - usageCache.at < 30_000) return usageCache.used
-  const used = dirSize(MEDIA_DIR)
-  usageCache = { used, at: Date.now() }
-  return used
+  const now = Date.now()
+
+  // 1. Return fresh cached value immediately if available (< 60s)
+  if (usageCache && now - usageCache.at < CACHE_TTL_MS) {
+    return usageCache.used
+  }
+
+  // 2. Return stale cached value immediately and trigger async background refresh
+  if (usageCache) {
+    if (!refreshPromise) {
+      startUsageComputation().catch(() => {})
+    }
+    return usageCache.used
+  }
+
+  // 3. Cold start (no cache yet): await the first non-blocking async computation
+  if (!refreshPromise) {
+    startUsageComputation()
+  }
+  return refreshPromise!
 }
 
 export function invalidateUsageCache() {
   usageCache = null
+  cacheGeneration++
+  refreshPromise = null
 }
 
 /** Free bytes on the volume that holds DATA_DIR (for /api/health). */
