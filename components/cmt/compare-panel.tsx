@@ -4,22 +4,90 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useSWRConfig } from 'swr'
 import {
   AlertCircle,
+  Bell,
   CheckCircle2,
   ChevronDown,
   ChevronLeft,
   ChevronRight,
+  Clock,
   Loader2,
   Pause,
   Play,
+  RefreshCw,
   RotateCcw,
   Sparkles,
   SplitSquareHorizontal,
+  Terminal,
+  X,
 } from 'lucide-react'
-import type { Scan } from '@/lib/types'
+import type { Scan, ChunkMatch } from '@/lib/types'
 import { fmtTime } from '@/lib/format'
 import { displayModelName } from '@/lib/models'
 import { candidateOptionsFor, hasAlternatives, sameShortSegment } from '@/lib/candidate-pick'
 import { CandidateChooser } from './candidate-chooser'
+
+interface RescanLogEntry {
+  time: string
+  msg: string
+  type: 'info' | 'warn' | 'success' | 'error'
+}
+
+interface RescanTaskState {
+  taskKey: string
+  pairIndex: number
+  shortStart: number
+  shortEnd: number
+  chunkIndex: number
+  status: 'preparing' | 'uploading' | 'scanning' | 'retrying' | 'done' | 'error'
+  progressMsg: string
+  attempt: number
+  maxAttempts: number
+  model?: string
+  logs: RescanLogEntry[]
+  result?: { movieStart: number; movieEnd: number; model: string }
+  errorMsg?: string
+}
+
+interface ToastNotification {
+  id: string
+  title: string
+  msg: string
+  pairIndex: number
+  taskKey: string
+}
+
+function playRescanChime() {
+  try {
+    const AudioCtx = window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext
+    if (!AudioCtx) return
+    const ctx = new AudioCtx()
+    const now = ctx.currentTime
+
+    // Note 1 (C5 - 523.25Hz)
+    const osc1 = ctx.createOscillator()
+    const gain1 = ctx.createGain()
+    osc1.type = 'sine'
+    osc1.frequency.setValueAtTime(523.25, now)
+    gain1.gain.setValueAtTime(0.12, now)
+    gain1.gain.exponentialRampToValueAtTime(0.001, now + 0.3)
+    osc1.connect(gain1)
+    gain1.connect(ctx.destination)
+    osc1.start(now)
+    osc1.stop(now + 0.3)
+
+    // Note 2 (G5 - 783.99Hz)
+    const osc2 = ctx.createOscillator()
+    const gain2 = ctx.createGain()
+    osc2.type = 'sine'
+    osc2.frequency.setValueAtTime(783.99, now + 0.12)
+    gain2.gain.setValueAtTime(0.18, now + 0.12)
+    gain2.gain.exponentialRampToValueAtTime(0.001, now + 0.5)
+    osc2.connect(gain2)
+    gain2.connect(ctx.destination)
+    osc2.start(now + 0.12)
+    osc2.stop(now + 0.5)
+  } catch {}
+}
 
 /** Side-by-side preview of matched windows: each parsed "Short X --> Movie Y" line
  *  is one pair with (near-)equal durations on both sides.
@@ -104,10 +172,12 @@ export function ComparePanel({ scan }: { scan: Scan }) {
   const [candIdx, setCandIdx] = useState<number | null>(null)
   const [shortProgress, setShortProgress] = useState(0)
   const [movieProgress, setMovieProgress] = useState(0)
-  const [rescanning, setRescanning] = useState(false)
-  const [rescanModel, setRescanModel] = useState<string | null>(null)
   const [showModelPicker, setShowModelPicker] = useState(false)
-  const [rescanFeedback, setRescanFeedback] = useState<{ ok: boolean; msg: string } | null>(null)
+  const [showConsole, setShowConsole] = useState(true)
+
+  // Persistent rescan task tracking keyed by `${shortStart.toFixed(1)}-${shortEnd.toFixed(1)}`
+  const [rescanTasks, setRescanTasks] = useState<Record<string, RescanTaskState>>({})
+  const [toastNotification, setToastNotification] = useState<ToastNotification | null>(null)
 
   const shortRef = useRef<HTMLVideoElement>(null)
   const movieRef = useRef<HTMLVideoElement>(null)
@@ -303,54 +373,212 @@ export function ComparePanel({ scan }: { scan: Scan }) {
     setIdx((cur) => (cur + delta + pairs.length) % pairs.length)
   }, [pairs.length])
 
-  // Targeted Rescan / Retry handler with Gemini Model choice (3.6, 3.7, 3.8)
-  async function handleRescanScene(chosenModel?: string) {
-    if (rescanning || !pair) return
-    setShowModelPicker(false)
-    setRescanning(true)
-    setRescanModel(chosenModel || null)
-    setRescanFeedback(null)
+  // Current scene task key
+  const currentTaskKey = pair ? `${pair.shortStart.toFixed(1)}-${pair.shortEnd.toFixed(1)}` : ''
+  const currentTask = currentTaskKey ? rescanTasks[currentTaskKey] : undefined
+  const isCurrentRescanning =
+    currentTask?.status === 'preparing' ||
+    currentTask?.status === 'uploading' ||
+    currentTask?.status === 'scanning' ||
+    currentTask?.status === 'retrying'
 
-    try {
-      const activeChunk = viewing ? viewing.chunkIndex : (pair.chunkIndex ?? Math.max(0, Math.floor((movieStart || 0) / 60)))
-      const res = await fetch(`/api/scans/${scan.id}/rescan-scene`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          shortStart: pair.shortStart,
-          shortEnd: pair.shortEnd,
+  // Targeted Rescan / Retry handler with Gemini Model choice (3.6, 3.7, 3.8) & 4x Auto Retry
+  async function handleRescanScene(chosenModel?: string) {
+    if (!pair) return
+    setShowModelPicker(false)
+
+    const taskKey = `${pair.shortStart.toFixed(1)}-${pair.shortEnd.toFixed(1)}`
+    const existing = rescanTasks[taskKey]
+    if (
+      existing?.status === 'preparing' ||
+      existing?.status === 'uploading' ||
+      existing?.status === 'scanning' ||
+      existing?.status === 'retrying'
+    ) {
+      return // Already in flight for this scene
+    }
+
+    const pairIndex = idx
+    const activeChunk = viewing ? viewing.chunkIndex : (pair.chunkIndex ?? Math.max(0, Math.floor((movieStart || 0) / 60)))
+    const targetShortStart = pair.shortStart
+    const targetShortEnd = pair.shortEnd
+    const targetMovieStart = movieStart
+    const targetMovieEnd = movieEnd
+
+    const appendLog = (msg: string, type: RescanLogEntry['type'] = 'info') => {
+      const time = new Date().toLocaleTimeString('en-US', { hour12: false })
+      setRescanTasks((prev) => {
+        const cur = prev[taskKey] || {
+          taskKey,
+          pairIndex,
+          shortStart: targetShortStart,
+          shortEnd: targetShortEnd,
           chunkIndex: activeChunk,
-          movieStart,
-          movieEnd,
-          model: chosenModel || undefined,
-        }),
+          status: 'preparing',
+          progressMsg: 'Starting rescan...',
+          attempt: 1,
+          maxAttempts: 4,
+          model: chosenModel,
+          logs: [],
+        }
+        return {
+          ...prev,
+          [taskKey]: {
+            ...cur,
+            logs: [...cur.logs, { time, msg, type }],
+          },
+        }
+      })
+    }
+
+    appendLog(`[Rescan Init] Short ${fmtTime(targetShortStart)}–${fmtTime(targetShortEnd)} | Movie chunk ${activeChunk + 1} | Model: ${chosenModel ? displayModelName(chosenModel) : 'Auto (First Available)'}`)
+
+    for (let attempt = 1; attempt <= 4; attempt++) {
+      setRescanTasks((prev) => {
+        const cur = prev[taskKey] || {
+          taskKey,
+          pairIndex,
+          shortStart: targetShortStart,
+          shortEnd: targetShortEnd,
+          chunkIndex: activeChunk,
+          status: 'preparing',
+          progressMsg: '',
+          attempt,
+          maxAttempts: 4,
+          model: chosenModel,
+          logs: [],
+        }
+        return {
+          ...prev,
+          [taskKey]: {
+            ...cur,
+            status: attempt === 1 ? 'preparing' : 'retrying',
+            attempt,
+            maxAttempts: 4,
+            progressMsg:
+              attempt === 1
+                ? 'Preparing short & movie chunk clips...'
+                : `High demand / API error — Auto-retrying attempt ${attempt}/4...`,
+          },
+        }
       })
 
-      const data = await res.json().catch(() => ({}))
-
-      if (!res.ok || !data.ok) {
-        setRescanFeedback({
-          ok: false,
-          msg: data.error || 'Rescan could not find a matching scene in this chunk.',
-        })
-        return
+      if (attempt > 1) {
+        appendLog(`[Attempt ${attempt}/4] High demand / rate limit backoff — waiting 3s before auto-retry...`, 'warn')
+        await new Promise((r) => setTimeout(r, 3000))
       }
 
-      setRescanFeedback({
-        ok: true,
-        msg: `Rescan Successful! Found movie ${fmtTime(data.movieStart)}–${fmtTime(data.movieEnd)} on ${displayModelName(data.model)}. Set as MAIN clip (User Review).`,
-      })
+      appendLog(`[Attempt ${attempt}/4] Cutting Short clip ${fmtTime(targetShortStart)}–${fmtTime(targetShortEnd)} & Movie chunk ${activeChunk + 1}...`, 'info')
 
-      // Reset candidate viewing so the user is immediately on the new MAIN rescan clip
-      setCandIdx(null)
-      await mutate(`/api/scans/${scan.id}`)
-    } catch {
-      setRescanFeedback({
-        ok: false,
-        msg: 'Network error while rescanning scene. Please try again.',
-      })
-    } finally {
-      setRescanning(false)
+      setRescanTasks((prev) => ({
+        ...prev,
+        [taskKey]: {
+          ...prev[taskKey]!,
+          status: 'uploading',
+          progressMsg: `Attempt ${attempt}/4: Uploading video clips to Gemini Files API...`,
+        },
+      }))
+      appendLog(`[Attempt ${attempt}/4] Uploading video clips to Gemini Files API...`, 'info')
+
+      setRescanTasks((prev) => ({
+        ...prev,
+        [taskKey]: {
+          ...prev[taskKey]!,
+          status: 'scanning',
+          progressMsg: `Attempt ${attempt}/4: Requesting frame-precise scan on ${chosenModel ? displayModelName(chosenModel) : 'Gemini'}...`,
+        },
+      }))
+      appendLog(`[Attempt ${attempt}/4] Calling Gemini AI for frame-precise rescan...`, 'info')
+
+      try {
+        const res = await fetch(`/api/scans/${scan.id}/rescan-scene`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            shortStart: targetShortStart,
+            shortEnd: targetShortEnd,
+            chunkIndex: activeChunk,
+            movieStart: targetMovieStart,
+            movieEnd: targetMovieEnd,
+            model: chosenModel || undefined,
+          }),
+        })
+
+        const data = await res.json().catch(() => ({}))
+
+        if (res.ok && data.ok) {
+          appendLog(`✅ Rescan Successful! Found Movie ${fmtTime(data.movieStart)}–${fmtTime(data.movieEnd)} on ${displayModelName(data.model)}. Set as MAIN clip.`, 'success')
+
+          setRescanTasks((prev) => ({
+            ...prev,
+            [taskKey]: {
+              ...prev[taskKey]!,
+              status: 'done',
+              progressMsg: `Rescan Successful! Found Movie ${fmtTime(data.movieStart)}–${fmtTime(data.movieEnd)}`,
+              result: { movieStart: data.movieStart, movieEnd: data.movieEnd, model: data.model },
+            },
+          }))
+
+          playRescanChime()
+
+          setToastNotification({
+            id: `toast-${Date.now()}`,
+            title: '✨ Rescan Successful!',
+            msg: `Short ${fmtTime(targetShortStart)}–${fmtTime(targetShortEnd)} → Movie ${fmtTime(data.movieStart)}–${fmtTime(data.movieEnd)} (${displayModelName(data.model)})`,
+            pairIndex,
+            taskKey,
+          })
+
+          setCandIdx(null)
+          await mutate(`/api/scans/${scan.id}`)
+          return
+        }
+
+        const errStr = String(data.error || '').toLowerCase()
+        const isRetryable =
+          errStr.includes('high demand') ||
+          errStr.includes('quota') ||
+          errStr.includes('rate') ||
+          errStr.includes('429') ||
+          errStr.includes('503') ||
+          errStr.includes('busy') ||
+          res.status === 429 ||
+          res.status === 503
+
+        if (isRetryable && attempt < 4) {
+          appendLog(`⚠️ Attempt ${attempt}/4 encountered high demand / rate limit: "${data.error || 'Server busy'}". Automatic retry ${attempt + 1}/4 scheduled.`, 'warn')
+          continue
+        } else {
+          appendLog(`❌ Rescan failed (Attempt ${attempt}/4): ${data.error || 'No match found in chunk'}`, 'error')
+          setRescanTasks((prev) => ({
+            ...prev,
+            [taskKey]: {
+              ...prev[taskKey]!,
+              status: 'error',
+              progressMsg: `Rescan Failed: ${data.error || 'No match found'}`,
+              errorMsg: data.error || 'No match found in chunk',
+            },
+          }))
+          return
+        }
+      } catch (err) {
+        if (attempt < 4) {
+          appendLog(`⚠️ Attempt ${attempt}/4 network error. Scheduling automatic retry ${attempt + 1}/4...`, 'warn')
+          continue
+        } else {
+          appendLog(`❌ Network error after 4 attempts.`, 'error')
+          setRescanTasks((prev) => ({
+            ...prev,
+            [taskKey]: {
+              ...prev[taskKey]!,
+              status: 'error',
+              progressMsg: 'Network error after 4 attempts',
+              errorMsg: 'Network error after 4 attempts',
+            },
+          }))
+          return
+        }
+      }
     }
   }
 
@@ -557,29 +785,69 @@ export function ComparePanel({ scan }: { scan: Scan }) {
         </div>
       )}
 
-      {/* Rescan Notification Banner */}
-      {rescanFeedback && (
-        <div
-          role="status"
-          className={`mt-3 flex items-center gap-2 rounded-md border p-2.5 text-xs ${
-            rescanFeedback.ok
-              ? 'border-success/30 bg-success/10 text-success'
-              : 'border-destructive/30 bg-destructive/10 text-destructive'
-          }`}
-        >
-          {rescanFeedback.ok ? (
-            <CheckCircle2 className="size-4 shrink-0 text-success" aria-hidden />
-          ) : (
-            <AlertCircle className="size-4 shrink-0 text-destructive" aria-hidden />
+      {/* Live Rescan Terminal Log Console */}
+      {currentTask && (
+        <div className="mt-3 overflow-hidden rounded-lg border border-indigo-500/30 bg-black/90 p-3 shadow-lg font-mono text-xs text-foreground">
+          <div className="flex items-center justify-between border-b border-border/40 pb-2 mb-2">
+            <div className="flex flex-wrap items-center gap-2">
+              <Terminal className="size-4 text-indigo-400" />
+              <span className="font-semibold text-indigo-300">Rescan Live Console</span>
+              <span className="rounded bg-indigo-500/20 px-2 py-0.5 text-[10px] text-indigo-300 border border-indigo-500/30">
+                Attempt {currentTask.attempt}/{currentTask.maxAttempts}
+              </span>
+              {isCurrentRescanning ? (
+                <span className="flex items-center gap-1.5 rounded-full bg-amber-500/20 text-amber-300 px-2.5 py-0.5 text-[10px] border border-amber-500/30 animate-pulse">
+                  <RefreshCw className="size-3 animate-spin" />
+                  {currentTask.status === 'retrying' ? 'High Demand Auto-Retry...' : 'Scanning Chunk...'}
+                </span>
+              ) : currentTask.status === 'done' ? (
+                <span className="flex items-center gap-1 rounded-full bg-emerald-500/20 text-emerald-300 px-2.5 py-0.5 text-[10px] border border-emerald-500/30">
+                  <CheckCircle2 className="size-3" /> Rescan Complete
+                </span>
+              ) : (
+                <span className="flex items-center gap-1 rounded-full bg-rose-500/20 text-rose-300 px-2.5 py-0.5 text-[10px] border border-rose-500/30">
+                  <AlertCircle className="size-3" /> Error Encountered
+                </span>
+              )}
+            </div>
+            <button
+              type="button"
+              onClick={() => setShowConsole((prev) => !prev)}
+              className="text-[11px] font-sans text-muted-foreground hover:text-foreground transition-colors"
+            >
+              {showConsole ? 'Minimize Console ▲' : 'Expand Logs ▼'}
+            </button>
+          </div>
+
+          <div className="text-[11px] text-indigo-200/90 mb-2 font-sans font-medium flex items-center justify-between">
+            <span>{currentTask.progressMsg}</span>
+            <span className="text-[10px] text-muted-foreground font-mono">
+              Short {fmtTime(currentTask.shortStart)}–{fmtTime(currentTask.shortEnd)}
+            </span>
+          </div>
+
+          {showConsole && (
+            <div className="max-h-36 overflow-y-auto space-y-1 rounded bg-black/80 p-2 border border-white/5 font-mono text-[11px]">
+              {currentTask.logs.map((l, i) => (
+                <div key={i} className="flex items-start gap-2 leading-snug">
+                  <span className="text-muted-foreground shrink-0 select-none">[{l.time}]</span>
+                  <span
+                    className={
+                      l.type === 'success'
+                        ? 'text-emerald-400 font-semibold'
+                        : l.type === 'warn'
+                        ? 'text-amber-300 font-medium'
+                        : l.type === 'error'
+                        ? 'text-rose-400 font-semibold'
+                        : 'text-zinc-300'
+                    }
+                  >
+                    {l.msg}
+                  </span>
+                </div>
+              ))}
+            </div>
           )}
-          <span className="flex-1 font-medium">{rescanFeedback.msg}</span>
-          <button
-            type="button"
-            onClick={() => setRescanFeedback(null)}
-            className="text-[10px] underline opacity-80 hover:opacity-100"
-          >
-            Dismiss
-          </button>
         </div>
       )}
 
@@ -588,7 +856,7 @@ export function ComparePanel({ scan }: { scan: Scan }) {
         <button
           type="button"
           onClick={togglePlay}
-          className="flex items-center gap-1.5 rounded-md bg-primary px-4 py-2 text-xs font-medium text-primary-foreground shadow-sm transition-transform active:scale-95"
+          className="flex items-center gap-1.5 rounded-md bg-primary px-4 py-2 text-xs font-medium text-primary-foreground shadow-sm transition-transform active:scale-95 cursor-pointer"
         >
           {playing ? <Pause className="size-3.5" aria-hidden /> : <Play className="size-3.5" aria-hidden />}
           {playing ? 'Pause both' : 'Play both'}
@@ -597,7 +865,7 @@ export function ComparePanel({ scan }: { scan: Scan }) {
         <button
           type="button"
           onClick={restart}
-          className="flex items-center gap-1.5 rounded-md border border-input bg-card px-3 py-2 text-xs font-medium hover:bg-secondary transition-colors"
+          className="flex items-center gap-1.5 rounded-md border border-input bg-card px-3 py-2 text-xs font-medium hover:bg-secondary transition-colors cursor-pointer"
           title="Restart playback from match start (R)"
         >
           <RotateCcw className="size-3.5" aria-hidden /> Restart match
@@ -608,20 +876,20 @@ export function ComparePanel({ scan }: { scan: Scan }) {
           <button
             type="button"
             onClick={() => {
-              if (rescanning) return
+              if (isCurrentRescanning) return
               setShowModelPicker((prev) => !prev)
             }}
-            disabled={rescanning}
+            disabled={isCurrentRescanning}
             className="flex items-center gap-1.5 rounded-md border border-indigo-500/50 bg-indigo-500/10 px-3.5 py-2 text-xs font-semibold text-indigo-300 hover:bg-indigo-500/20 active:scale-95 transition-all disabled:opacity-50 cursor-pointer"
-            title="Choose Gemini Model (3.6, 3.7, 3.8) to rescan this scene"
+            title="Choose Gemini Model (3.6, 3.7, 3.8) to rescan this scene with 4x auto-retry"
           >
-            {rescanning ? (
+            {isCurrentRescanning ? (
               <Loader2 className="size-3.5 animate-spin text-indigo-400" aria-hidden />
             ) : (
               <Sparkles className="size-3.5 text-indigo-400" aria-hidden />
             )}
-            {rescanning ? (
-              <span>Rescanning {rescanModel ? `(${displayModelName(rescanModel)})` : ''}...</span>
+            {isCurrentRescanning ? (
+              <span>Rescanning (Attempt {currentTask?.attempt || 1}/4)...</span>
             ) : (
               <>
                 <span>Rescan Scene (Retry)</span>
@@ -703,6 +971,40 @@ export function ComparePanel({ scan }: { scan: Scan }) {
           </span>
         </div>
       </div>
+
+      {/* Floating Bottom Toast Notification Banner with Sound & Jump Link */}
+      {toastNotification && (
+        <div className="fixed bottom-6 right-6 z-50 max-w-sm animate-in slide-in-from-bottom-5 fade-in duration-300">
+          <div className="flex items-start gap-3 rounded-xl border border-indigo-500/50 bg-zinc-950/95 p-3.5 shadow-2xl backdrop-blur-md ring-1 ring-indigo-500/20">
+            <div className="flex size-9 shrink-0 items-center justify-center rounded-lg bg-indigo-500/20 text-indigo-400 border border-indigo-500/30">
+              <Bell className="size-5 animate-bounce" />
+            </div>
+            <div className="flex-1 space-y-1">
+              <div className="flex items-center justify-between">
+                <p className="text-xs font-bold text-foreground">{toastNotification.title}</p>
+                <button
+                  type="button"
+                  onClick={() => setToastNotification(null)}
+                  className="text-muted-foreground hover:text-foreground cursor-pointer"
+                >
+                  <X className="size-3.5" />
+                </button>
+              </div>
+              <p className="text-xs text-muted-foreground leading-snug">{toastNotification.msg}</p>
+              <button
+                type="button"
+                onClick={() => {
+                  setIdx(toastNotification.pairIndex)
+                  setToastNotification(null)
+                }}
+                className="mt-1 flex items-center gap-1 rounded-md bg-indigo-600 px-2.5 py-1 text-[11px] font-semibold text-white hover:bg-indigo-500 active:scale-95 transition-all cursor-pointer"
+              >
+                Jump to Rescanned Scene →
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </section>
   )
 }

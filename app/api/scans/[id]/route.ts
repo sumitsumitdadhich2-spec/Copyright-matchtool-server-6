@@ -70,16 +70,26 @@ export async function PATCH(req: Request, ctx: { params: Promise<{ id: string }>
     return NextResponse.json({ error: 'Not found' }, { status: 404 })
   }
 
-  const body = (await req.json().catch(() => ({}))) as { verifierEnabled?: boolean }
+  const body = (await req.json().catch(() => ({}))) as { verifierEnabled?: boolean; customName?: string }
+  let updated = false
+
+  if (body.customName !== undefined) {
+    scan.customName = typeof body.customName === 'string' ? body.customName.trim() || null : null
+    updated = true
+  }
+
   if (body.verifierEnabled !== undefined) {
     const enabled = Boolean(body.verifierEnabled)
     scan.verifierEnabled = enabled
     scheduler.setVerifierEnabled(id, enabled)
-    const { saveScan } = await import('@/lib/store')
-    saveScan(scan, { immediate: true })
-    return NextResponse.json({ ok: true, verifierEnabled: enabled })
+    updated = true
   }
 
-  return NextResponse.json({ ok: true })
+  if (updated) {
+    const { saveScan } = await import('@/lib/store')
+    saveScan(scan, { immediate: true })
+  }
+
+  return NextResponse.json({ ok: true, customName: scan.customName, verifierEnabled: scan.verifierEnabled })
 }
 

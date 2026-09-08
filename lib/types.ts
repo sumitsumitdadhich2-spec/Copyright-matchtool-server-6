@@ -727,6 +727,8 @@ export interface ScanReport {
 export interface Scan {
   id: string
   createdAt: number
+  /** Custom human-readable name set by user for history / notifications. */
+  customName?: string | null
   /** Account that owns this scan and its background worker quota. */
   ownerUsername?: string
   /** Durable queue state; persisted so queued work can recover after restart. */
@@ -797,6 +799,7 @@ export interface Scan {
 export interface ScanSummary {
   id: string
   createdAt: number
+  customName?: string | null
   ownerUsername?: string
   background?: Scan['background']
   status: ScanStatus

@@ -225,6 +225,9 @@ export function LiveActivityBar({ scan, onScrollToLogs }: LiveActivityBarProps) 
                 >
                   {activity.badge}
                 </span>
+                <span className="inline-flex items-center rounded-full border border-border/80 bg-background/80 px-2.5 py-0.5 text-[11px] font-bold text-foreground truncate max-w-[200px]">
+                  {scan.customName || scan.shortName || scan.movieName || `Scan ${scan.id.slice(0, 6)}`}
+                </span>
                 {activity.isLive && (
                   <span className="inline-flex items-center gap-1 rounded-full border border-primary/30 bg-primary/10 px-2 py-0.5 text-[10px] font-mono font-medium text-primary">
                     <Activity className="size-3 animate-spin text-primary" />

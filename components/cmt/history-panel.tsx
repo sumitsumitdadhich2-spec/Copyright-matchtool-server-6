@@ -2,7 +2,7 @@
 
 import { useState } from 'react'
 import useSWR from 'swr'
-import { History, Plus, Trash2, Loader2 } from 'lucide-react'
+import { History, Plus, Trash2, Loader2, Pencil, Check, X } from 'lucide-react'
 import type { ScanSummary } from '@/lib/types'
 import { fetcher, fmtTime } from '@/lib/format'
 
@@ -23,6 +23,30 @@ export function HistoryPanel({ activeId, onSelect, onNew }: { activeId: string |
   const [deletingId, setDeletingId] = useState<string | null>(null)
   const [confirmClearAll, setConfirmClearAll] = useState(false)
   const [clearingAll, setClearingAll] = useState(false)
+
+  const [editingId, setEditingId] = useState<string | null>(null)
+  const [editingName, setEditingName] = useState('')
+  const [savingName, setSavingName] = useState(false)
+
+  async function handleSaveName(id: string) {
+    if (!editingName.trim()) return
+    setSavingName(true)
+    try {
+      const res = await fetch(`/api/scans/${id}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ customName: editingName.trim() }),
+      })
+      if (res.ok) {
+        await mutate()
+        setEditingId(null)
+      }
+    } catch (err) {
+      console.error('Failed to rename scan:', err)
+    } finally {
+      setSavingName(false)
+    }
+  }
 
   async function handleDelete(id: string) {
     setDeletingId(id)
@@ -127,7 +151,57 @@ export function HistoryPanel({ activeId, onSelect, onNew }: { activeId: string |
                   className="btn-press flex-1 min-w-0 p-2.5 text-left focus-visible:outline-none"
                 >
                   <div className="flex items-center gap-2">
-                    <span className="truncate font-medium text-xs text-foreground">{s.movieName || 'Untitled scan'}</span>
+                    {editingId === s.id ? (
+                      <div className="flex items-center gap-1 min-w-0 flex-1" onClick={(e) => e.stopPropagation()}>
+                        <input
+                          type="text"
+                          value={editingName}
+                          onChange={(e) => setEditingName(e.target.value)}
+                          onKeyDown={(e) => {
+                            if (e.key === 'Enter') void handleSaveName(s.id)
+                            if (e.key === 'Escape') setEditingId(null)
+                          }}
+                          placeholder="Scan name..."
+                          className="w-full rounded border border-primary bg-background px-1.5 py-0.5 text-xs text-foreground focus:outline-none"
+                          autoFocus
+                        />
+                        <button
+                          type="button"
+                          disabled={savingName}
+                          onClick={() => void handleSaveName(s.id)}
+                          className="rounded bg-primary p-1 text-primary-foreground hover:opacity-90"
+                          title="Save scan name"
+                        >
+                          {savingName ? <Loader2 className="size-3 animate-spin" /> : <Check className="size-3" />}
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setEditingId(null)}
+                          className="rounded bg-muted p-1 text-muted-foreground hover:bg-muted/80"
+                          title="Cancel"
+                        >
+                          <X className="size-3" />
+                        </button>
+                      </div>
+                    ) : (
+                      <div className="flex items-center gap-1.5 min-w-0 flex-1 group/name">
+                        <span className="truncate font-medium text-xs text-foreground">
+                          {s.customName || s.movieName || s.shortName || 'Untitled scan'}
+                        </span>
+                        <button
+                          type="button"
+                          onClick={(e) => {
+                            e.stopPropagation()
+                            setEditingId(s.id)
+                            setEditingName(s.customName || s.movieName || s.shortName || '')
+                          }}
+                          className="opacity-0 group-hover/name:opacity-100 rounded p-0.5 text-muted-foreground hover:text-foreground transition-opacity"
+                          title="Rename scan"
+                        >
+                          <Pencil className="size-3" />
+                        </button>
+                      </div>
+                    )}
                     <span className={`ml-auto shrink-0 rounded-full px-2 py-0.5 text-[10px] ${STATUS_CLS[s.status] || 'bg-muted text-muted-foreground'}`}>
                       {s.background?.state === 'queued' ? `queued${s.background.position ? ` #${s.background.position}` : ''}` : s.background?.state === 'running' ? 'background' : s.status}
                     </span>

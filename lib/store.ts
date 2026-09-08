@@ -340,6 +340,7 @@ export function listScans(): ScanSummary[] {
     out.push({
       id: s.id,
       createdAt: s.createdAt,
+      customName: s.customName || null,
       ownerUsername: s.ownerUsername,
       background: s.background,
       status: s.status,

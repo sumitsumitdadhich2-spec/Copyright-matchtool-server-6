@@ -9,6 +9,8 @@ import { buildRenderSegments, type RenderSegment } from '@/lib/render-segments'
 import { candidateOptionsFor, hasAlternatives } from '@/lib/candidate-pick'
 import { computeShortCoverage } from '@/lib/short-coverage'
 import { CandidateChooser } from './candidate-chooser'
+import { ScanUsageReport } from './scan-usage-report'
+import { ScanTimingReport } from './scan-timing-report'
 
 const RESOLUTIONS: { value: RenderResolution; label: string; defaultKbps: number }[] = [
   { value: '480p', label: '480p (854×480)', defaultKbps: 2000 },
@@ -551,6 +553,11 @@ export function RenderPanel({ scan }: { scan: Scan }) {
             />
           </div>
         )}
+      </div>
+
+      <div className="mt-4 flex flex-col gap-4">
+        <ScanTimingReport scan={scan} />
+        <ScanUsageReport scan={scan} />
       </div>
     </section>
   )

@@ -61,8 +61,8 @@ import { globalGeminiCoordinator } from './global-gemini-coordinator'
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
 
-/** Max attempts per chunk before it is marked failed. */
-const MAX_CHUNK_ATTEMPTS = 3
+/** Max attempts per chunk before it is marked failed (capped strictly at 7 to prevent infinite retry loops). */
+const MAX_CHUNK_ATTEMPTS = 7
 
 /** One API key lane (1-20). Gemini Files API uploads are PER KEY,
  *  so each lane keeps its own uploaded short-SEGMENT URIs (one per minute). */
@@ -2380,7 +2380,12 @@ class Scheduler {
         this.mark(job)
       } catch (err) {
         const e = err instanceof GeminiError ? err : classifyError(err)
-        if (e.kind === 'invalid_key') {
+        chunk.attempts = (chunk.attempts || 0) + 1
+
+        if (chunk.attempts >= MAX_CHUNK_ATTEMPTS) {
+          chunk.status = 'failed'
+          addLog(scan, 'error', `${minutePrefix}Chunk ${chunkIndex} reached max retry limit (${chunk.attempts}/${MAX_CHUNK_ATTEMPTS} attempts) — stopped to protect quota: ${e.message.slice(0, 140)}`)
+        } else if (e.kind === 'invalid_key') {
           for (const mm of MODEL_POOL) {
             setModelExhausted(mm.id, lane.apiKey, mm.rpd)
           }
@@ -2392,7 +2397,7 @@ class Scheduler {
           }
           chunk.status = 'pending'
           job.queue.push(chunkIndex)
-          addLog(scan, 'error', `API Key ${lane.idx} is invalid/expired — permanently disabled; Chunk ${chunkIndex} re-queued for another key`)
+          addLog(scan, 'error', `API Key ${lane.idx} is invalid/expired — permanently disabled; Chunk ${chunkIndex} attempt ${chunk.attempts}/${MAX_CHUNK_ATTEMPTS} re-queued for another key`)
         } else if (e.kind === 'rpd' || e.kind === 'unavailable') {
           globalGeminiCoordinator.reportExhausted(lane.apiKey, m.id, 0)
           setModelExhausted(m.id, lane.apiKey, m.rpd)
@@ -2403,25 +2408,19 @@ class Scheduler {
           }
           chunk.status = 'pending'
           job.queue.push(chunkIndex)
-          addLog(scan, 'warn', `${m.id} (key ${lane.idx}) model daily quota exhausted (${m.rpd}/${m.rpd} RPD) — Chunk ${chunkIndex} re-queued for another worker (key ${lane.idx}'s other models remain active)`)
+          addLog(scan, 'warn', `${m.id} (key ${lane.idx}) model daily quota exhausted (${m.rpd}/${m.rpd} RPD) — Chunk ${chunkIndex} attempt ${chunk.attempts}/${MAX_CHUNK_ATTEMPTS} re-queued for another worker (key ${lane.idx}'s other models remain active)`)
         } else if (e.kind === 'rate') {
           globalGeminiCoordinator.reportRateLimit(lane.apiKey, m.id, RATE_COOLDOWN_MS, 0)
           job.cooldownUntil[this.rateKey(lane, m)] = Date.now() + RATE_COOLDOWN_MS
           chunk.status = 'pending'
           job.queue.push(chunkIndex)
-          addLog(scan, 'warn', `Rate limit on ${m.id} (key ${lane.idx}) — Chunk ${chunkIndex} re-queued`)
+          addLog(scan, 'warn', `Rate limit on ${m.id} (key ${lane.idx}) — Chunk ${chunkIndex} attempt ${chunk.attempts}/${MAX_CHUNK_ATTEMPTS} re-queued`)
         } else {
-          chunk.attempts += 1
-          if (chunk.attempts >= MAX_CHUNK_ATTEMPTS) {
-            chunk.status = 'failed'
-            addLog(scan, 'error', `${minutePrefix}Chunk ${chunkIndex} failed after ${chunk.attempts} attempt(s): ${e.message.slice(0, 140)}`)
-          } else {
-            chunk.status = 'pending'
-            job.queue.push(chunkIndex)
-            addLog(scan, 'warn', `Chunk ${chunkIndex} attempt ${chunk.attempts} failed on ${m.id} (key ${lane.idx}) — re-queued: ${e.message.slice(0, 120)}`)
-          }
+          chunk.status = 'pending'
+          job.queue.push(chunkIndex)
+          addLog(scan, 'warn', `Chunk ${chunkIndex} attempt ${chunk.attempts}/${MAX_CHUNK_ATTEMPTS} failed on ${m.id} (key ${lane.idx}) — re-queued: ${e.message.slice(0, 120)}`)
         }
-          this.mark(job)
+        this.mark(job)
       } finally {
         if (releaseGlobalLock) releaseGlobalLock(60)
         // The short video is reused across chunks; the chunk upload is one-shot.

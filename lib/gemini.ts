@@ -1146,10 +1146,11 @@ export function parseVerdict(raw: string): { same: boolean; reason: string } | n
 /** Parse a rescan answer into a chunk-local window, or null for NOT FOUND / unparseable. */
 export function parseRescanMatch(raw: string): { start: number; end: number } | null {
   if (/NOT\s*FOUND/i.test(raw) && !/MATCH\s*:/i.test(raw)) return null
-  const m = raw.match(/MATCH\s*:\s*(\d+:\d+(?:\.\d+)?)\s*-\s*(\d+:\d+(?:\.\d+)?)/i)
+  const clean = raw.replace(/\*\*/g, '')
+  const m = clean.match(/MATCH\s*:\s*(\d+(?::\d{1,2})+(?:\.\d+)?)\s*(?:-|–|—|to)\s*(\d+(?::\d{1,2})+(?:\.\d+)?)/i)
   if (!m) return null
-  const start = parseTs(m[1])
-  const end = parseTs(m[2])
+  const start = parseTsFlexible(m[1]) ?? parseTs(m[1])
+  const end = parseTsFlexible(m[2]) ?? parseTs(m[2])
   if (start === null || end === null || end <= start) return null
   return { start, end }
 }

@@ -402,7 +402,14 @@ async function runGapBackup(scan: Scan, apiKeys: string[], gaps: ShortRange[], c
             persist(scan, state)
           } catch (err) {
             const e = err instanceof GeminiError ? err : classifyError(err)
-            if (e.kind === 'invalid_key') {
+            item.attempts = (item.attempts || 0) + 1
+
+            if (item.attempts >= 7) {
+              request.status = 'failed'
+              request.error = e.message.slice(0, 500)
+              request.finishedAt = Date.now()
+              log(scan, 'error', `Missing-scene minute ${minute.index + 1}, chunk ${chunkIndex + 1} reached max retry limit (${item.attempts}/7) — skipping to protect quota: ${e.message.slice(0, 120)}`)
+            } else if (e.kind === 'invalid_key') {
               for (const l of allLanes) {
                 if (l.key === lane.key) {
                   l.dead = true
@@ -412,27 +419,19 @@ async function runGapBackup(scan: Scan, apiKeys: string[], gaps: ShortRange[], c
                 }
               }
               queue.push(item)
-              log(scan, 'error', `Missing-scene finder: Key ${lane.keyIndex + 1} is invalid/expired — permanently disabled; chunk ${chunkIndex + 1} re-queued for another key`)
+              log(scan, 'error', `Missing-scene finder: Key ${lane.keyIndex + 1} is invalid/expired — permanently disabled; chunk ${chunkIndex + 1} attempt ${item.attempts}/7 re-queued for another key`)
             } else if (e.kind === 'rpd' || e.kind === 'unavailable') {
               setModelExhausted(lane.model.id, lane.key, lane.model.rpd)
               lane.dead = true
               queue.push(item)
-              log(scan, 'warn', `Missing-scene finder: ${lane.model.id} (key ${lane.keyIndex + 1}) daily quota exhausted (${lane.model.rpd}/${lane.model.rpd} RPD) — model lane removed, key ${lane.keyIndex + 1}'s other models remain active; chunk ${chunkIndex + 1} re-queued`)
+              log(scan, 'warn', `Missing-scene finder: ${lane.model.id} (key ${lane.keyIndex + 1}) daily quota exhausted (${lane.model.rpd}/${lane.model.rpd} RPD) — model lane removed, key ${lane.keyIndex + 1}'s other models remain active; chunk ${chunkIndex + 1} attempt ${item.attempts}/7 re-queued`)
             } else if (e.kind === 'rate' || is503OrBusyError(err)) {
               lane.cooldownUntil = Date.now() + 5_000
               queue.push(item)
-              log(scan, 'warn', `Missing-scene finder: Rate limit / Empty response on ${lane.model.id} (key ${lane.keyIndex + 1}) — chunk ${chunkIndex + 1} re-queued (cooldown 5s)`)
+              log(scan, 'warn', `Missing-scene finder: Rate limit / Empty response on ${lane.model.id} (key ${lane.keyIndex + 1}) — chunk ${chunkIndex + 1} attempt ${item.attempts}/7 re-queued (cooldown 5s)`)
             } else {
-              item.attempts += 1
-              if (item.attempts < 6) {
-                queue.push(item)
-                log(scan, 'warn', `Missing-scene finder: Chunk ${chunkIndex + 1} attempt ${item.attempts} failed on ${lane.model.id} (key ${lane.keyIndex + 1}) [${e.message.slice(0, 100)}] — auto-retrying on another lane...`)
-              } else {
-                request.status = 'failed'
-                request.error = e.message.slice(0, 500)
-                request.finishedAt = Date.now()
-                log(scan, 'error', `Missing-scene minute ${minute.index + 1}, chunk ${chunkIndex + 1} failed after ${item.attempts} attempt(s): ${e.message.slice(0, 120)}`)
-              }
+              queue.push(item)
+              log(scan, 'warn', `Missing-scene finder: Chunk ${chunkIndex + 1} attempt ${item.attempts}/7 failed on ${lane.model.id} (key ${lane.keyIndex + 1}) [${e.message.slice(0, 100)}] — auto-retrying on another lane...`)
             }
             persist(scan, state)
           } finally {
@@ -468,7 +467,7 @@ async function runGapBackup(scan: Scan, apiKeys: string[], gaps: ShortRange[], c
       persist(scan, state)
     }
 
-    await Promise.allSettled(uploadJobs.values())
+    await Promise.allSettled(shortUploadPromises.values())
     await Promise.allSettled(uploadedResources.map(({ ai, name }) => deleteFileQuiet(ai, name)))
     state.activeBatch = undefined
     if (control.stopping) {

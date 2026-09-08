@@ -1,10 +1,12 @@
 'use client'
 
-import { FileCheck2 } from 'lucide-react'
-import type { Scan } from '@/lib/types'
+import { FileCheck2, Loader2, RefreshCw, Clock, CheckCircle2, XCircle, AlertTriangle } from 'lucide-react'
+import type { Scan, ChunkMatch } from '@/lib/types'
 import { fmtTime, fmtDuration } from '@/lib/format'
 import { displayModelName } from '@/lib/models'
 import { originLabel, isRejectedKept } from '@/lib/candidate-pick'
+import { ScanUsageReport } from './scan-usage-report'
+import { ScanTimingReport } from './scan-timing-report'
 
 export function ReportPanel({ scan }: { scan: Scan }) {
   const report = scan.report
@@ -15,6 +17,86 @@ export function ReportPanel({ scan }: { scan: Scan }) {
   const groupsPending =
     report.groupsPending ??
     Math.max(0, (report.groupsTotal ?? 0) - (report.groupsConfirmed ?? 0) - (report.groupsRejected ?? 0) - (report.groupsUnverified ?? 0))
+
+  const candidateGroups = scan.candidateGroups || []
+
+  const getMatchLiveStatus = (m: ChunkMatch) => {
+    // Find associated group in candidateGroups
+    const group = candidateGroups.find(
+      (g) => Math.abs(g.shortStart - m.shortStart) < 1.0 || g.candidates.some((c) => c.chunkIndex === m.chunkIndex),
+    )
+
+    if (group) {
+      if (group.status === 'verifying') {
+        return (
+          <span className="inline-flex items-center gap-1.5 rounded-full bg-blue-500/15 px-2 py-0.5 text-[11px] font-semibold text-blue-500 animate-pulse border border-blue-500/30">
+            <Loader2 className="size-3 animate-spin text-blue-500" />
+            Verifying (24fps)...
+          </span>
+        )
+      }
+      if (group.status === 'rescanning') {
+        return (
+          <span className="inline-flex items-center gap-1.5 rounded-full bg-purple-500/15 px-2 py-0.5 text-[11px] font-semibold text-purple-500 animate-pulse border border-purple-500/30">
+            <RefreshCw className="size-3 animate-spin text-purple-500" />
+            Rescanning Chunk...
+          </span>
+        )
+      }
+      if (group.status === 'pending') {
+        return (
+          <span className="inline-flex items-center gap-1.5 rounded-full bg-amber-500/10 px-2 py-0.5 text-[11px] font-medium text-amber-500 border border-amber-500/20">
+            <Clock className="size-3 text-amber-500" />
+            Queued for Verifier
+          </span>
+        )
+      }
+      if (group.status === 'confirmed') {
+        return (
+          <span className="inline-flex items-center gap-1 text-emerald-500 font-semibold text-xs">
+            <CheckCircle2 className="size-3.5" />
+            yes ({group.confirmedViaRescan ? 'rescan verified' : '24fps batch'})
+          </span>
+        )
+      }
+      if (group.status === 'rejected') {
+        return (
+          <span className="inline-flex items-center gap-1 text-destructive font-medium text-xs">
+            <XCircle className="size-3.5" />
+            no (rejected)
+          </span>
+        )
+      }
+      if (group.status === 'unverified') {
+        return (
+          <span className="inline-flex items-center gap-1 text-amber-500 font-medium text-xs">
+            <AlertTriangle className="size-3.5" />
+            unverified (kept)
+          </span>
+        )
+      }
+    }
+
+    // Static fallback if group state not present
+    if (m.verified || m.batchVerified === 'confirmed') {
+      return (
+        <span className="inline-flex items-center gap-1 text-emerald-500 font-medium">
+          <CheckCircle2 className="size-3.5" />
+          {m.batchVerified === 'confirmed' ? 'yes (batch 24fps)' : m.viaRescan ? 'yes (rescan)' : 'yes'}
+        </span>
+      )
+    }
+    if (m.batchVerified === 'rejected') {
+      return (
+        <span className="inline-flex items-center gap-1 text-destructive font-medium">
+          <XCircle className="size-3.5" />
+          no (rejected)
+        </span>
+      )
+    }
+
+    return <span className="text-warning">no</span>
+  }
 
   return (
     <section aria-label="Final report" className="panel border-success/30">
@@ -112,15 +194,7 @@ export function ReportPanel({ scan }: { scan: Scan }) {
                       <span className={isRejectedKept(m) ? 'text-destructive' : 'text-muted-foreground'}>{isRejectedKept(m) ? 'rejected kept' : originLabel(m.origin, m.originWindow)}</span>
                     </td>
                     <td className="py-1">
-                      {m.verified || m.batchVerified === 'confirmed' ? (
-                        <span className="text-success font-medium">
-                          {m.batchVerified === 'confirmed' ? 'yes (batch 24fps)' : m.viaRescan ? 'yes (rescan)' : 'yes'}
-                        </span>
-                      ) : m.batchVerified === 'rejected' ? (
-                        <span className="text-destructive font-medium">no (rejected)</span>
-                      ) : (
-                        <span className="text-warning">no</span>
-                      )}
+                      {getMatchLiveStatus(m)}
                     </td>
                   </tr>
                 ))}
@@ -129,6 +203,11 @@ export function ReportPanel({ scan }: { scan: Scan }) {
           </div>
         </div>
       )}
+
+      <div className="mt-4 flex flex-col gap-4">
+        <ScanTimingReport scan={scan} />
+        <ScanUsageReport scan={scan} />
+      </div>
     </section>
   )
 }

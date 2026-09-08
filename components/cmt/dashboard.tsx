@@ -26,6 +26,7 @@ import { RenderPanel } from './render-panel'
 import { HistoryPanel } from './history-panel'
 import { GapBackupPanel } from './gap-backup-panel'
 import { LiveActivityBar } from './live-activity-bar'
+import { TopMilestoneBanner } from './top-milestone-banner'
 
 interface ScanResponse {
   scan: Scan
@@ -129,6 +130,7 @@ export function Dashboard() {
 
   return (
     <div className="mx-auto flex min-h-screen w-full max-w-7xl flex-col gap-4 p-4 md:p-6">
+      <TopMilestoneBanner scan={scan} onSelectScan={setScanId} />
       <header className="alert-in sticky top-3 z-20 flex flex-wrap items-center gap-3 rounded-xl border border-border bg-card/80 p-3 shadow-lg backdrop-blur-md md:px-4">
         <div className="flex items-center gap-3">
           <span className="flex size-10 shrink-0 items-center justify-center rounded-lg bg-primary text-primary-foreground shadow-md shadow-primary/30">
